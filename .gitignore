@@ -1,0 +1,5 @@
+data.sqlite3
+__pycache__/
+uploads/*
+!uploads/.gitkeep
+.env
