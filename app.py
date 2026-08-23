@@ -1,8 +1,9 @@
 
-import os, sqlite3, secrets, hashlib, hmac, time, mimetypes, json, urllib.request, urllib.error
+import os, sqlite3, secrets, hashlib, hmac, time, mimetypes, json, urllib.request, urllib.error, re, unicodedata
 from pathlib import Path
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory, make_response, redirect, session
+from google.cloud import storage
 
 BASE = Path(__file__).resolve().parent
 DB = BASE / "data.sqlite3"
@@ -17,7 +18,18 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "CAMBIA_ESTA_CLAVE")
 MAX_TICKETS = 999999
 PRICE = 10
 JSONPE_TOKEN = os.environ.get("JSONPE_TOKEN", "").strip()
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "").strip()
 DNI_CACHE = {}
+
+def storage_bucket():
+    if not GCS_BUCKET_NAME:
+        raise RuntimeError("GCS_BUCKET_NAME no está configurado")
+    return storage.Client().bucket(GCS_BUCKET_NAME)
+
+def safe_filename_part(value):
+    value=unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    value=re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
+    return value[:60] or "SIN_NOMBRE"
 
 def db():
     c=sqlite3.connect(DB)
@@ -210,8 +222,11 @@ def create_order():
                 continue
 
         ext={ "image/jpeg":".jpg","image/png":".png","image/webp":".webp"}[proof.mimetype]
-        filename=f"{code}{ext}"
-        (UPLOADS/filename).write_bytes(raw)
+        timestamp=time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        filename=(f"{document_type}_{document_number}_{safe_filename_part(name)}_"
+                  f"{timestamp}_{code}{ext}")
+        blob=storage_bucket().blob(filename)
+        blob.upload_from_string(raw, content_type=proof.mimetype)
         c.execute("UPDATE orders SET proof_path=? WHERE id=?",(filename,oid))
         c.commit()
     except Exception:
@@ -310,7 +325,15 @@ def admin_orders():
 def proof(filename):
     # filename comes from our own generated code, not arbitrary user input.
     if Path(filename).name != filename: return "bad",400
-    return send_from_directory(UPLOADS,filename)
+    try:
+        blob=storage_bucket().blob(filename)
+        raw=blob.download_as_bytes()
+        response=make_response(raw)
+        response.headers["Content-Type"]=blob.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        response.headers["Cache-Control"]="private, no-store"
+        return response
+    except Exception:
+        return "No se pudo cargar el comprobante",404
 
 @app.post("/api/admin/orders/<int:oid>/approve")
 @admin_required
