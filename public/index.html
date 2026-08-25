@@ -77,8 +77,9 @@ footer{background:#030305;color:#777;text-align:center;padding:35px;font-size:12
         <div class="field"><label for="buyerName">Nombre completo</label>
           <input id="buyerName" type="text" placeholder="Ej. Juan Pérez" autocomplete="name">
         </div>
-        <div class="field"><label for="buyerPhone">Celular</label>
-          <input id="buyerPhone" type="tel" placeholder="Ej. 999 999 999" autocomplete="tel">
+        <div class="field"><label for="buyerPhone">Número de WhatsApp</label>
+          <input id="buyerPhone" type="tel" inputmode="numeric" placeholder="Ej. 999999999" autocomplete="tel" maxlength="9">
+          <div class="note" style="margin-top:7px">Ingresa un número peruano de 9 dígitos que empiece con 9.</div>
         </div>
         <div class="field"><label for="documentType">Documento de identidad</label>
           <select id="documentType"><option value="DNI">DNI</option><option value="CE">Carnet de Extranjería</option></select>
@@ -103,8 +104,8 @@ footer{background:#030305;color:#777;text-align:center;padding:35px;font-size:12
         <h3>2. Paga únicamente por Yape</h3>
         <p style="color:#bbb;margin-top:0">Realiza el pago por el monto exacto a cualquiera de estos números y luego adjunta tu comprobante.</p>
         <div style="margin:14px 0;padding:14px 16px;border:1px solid #25d366;border-radius:12px;background:#07130b;color:#dfffea">
-          <strong>📲 IMPORTANTE: ENVÍA TU CAPTURA DE PAGO</strong><br>
-          <span style="color:#b9d9c5">Después de generar tu solicitud, los datos de tu compra se enviarán por WhatsApp al <b>905 674 389</b>. También debes enviar a ese mismo número la <b>captura del pago realizado por Yape</b> para poder validar tu solicitud.</span>
+          <strong>📲 CONFIRMACIÓN POR WHATSAPP</strong><br>
+          <span style="color:#b9d9c5">Después de registrar tu compra, pulsa el botón de WhatsApp para enviar tu solicitud al <b>905 674 389</b>. El comprobante ya quedará guardado en nuestro sistema y no tendrás que adjuntarlo nuevamente.</span>
         </div>
 
         <div class="yape-item">
@@ -133,9 +134,9 @@ footer{background:#030305;color:#777;text-align:center;padding:35px;font-size:12
       <div class="ticket-list" id="ticketList"></div>
       <p class="note">Guarda tu código de solicitud. Los tickets aparecerán como oficiales cuando el pago sea validado.</p>
       <a id="whatsappBtn" class="confirm-btn" href="#" target="_blank" rel="noopener" style="display:none;text-decoration:none;text-align:center;background:#25d366;color:#07130b">
-        📲 ENVIAR DATOS Y COMPROBANTE POR WHATSAPP
+        📲 RECIBIR CONFIRMACIÓN POR WHATSAPP
       </a>
-      <p class="note" style="margin-top:10px"><b>WhatsApp de recepción: 905 674 389.</b> Envía también allí la captura del pago de Yape.</p>
+      <p class="note" style="margin-top:10px">Pulsa el botón y envíanos el mensaje preparado. Así podremos responder y confirmar el proceso por WhatsApp. No necesitas volver a adjuntar el comprobante.</p>
     </div>
   </div>
 </section>
@@ -242,13 +243,18 @@ document.getElementById('documentNumber').addEventListener('input',()=>{
   dniLookupTimer=setTimeout(lookupDni,350);
 });
 
+document.getElementById('buyerPhone').addEventListener('input',event=>{
+  event.target.value=event.target.value.replace(/\D/g,'').slice(0,9);
+});
+
 async function submitOrder(){
   const name=document.getElementById('buyerName').value.trim();
   const phone=document.getElementById('buyerPhone').value.trim();
   const documentType=document.getElementById('documentType').value;
   const documentNumber=document.getElementById('documentNumber').value.trim();
   const proof=document.getElementById('proof').files[0];
-  if(!name || !phone){ setMsg('Completa tu nombre y celular.'); return; }
+  if(!name){ setMsg('Completa tu nombre.'); return; }
+  if(!/^9\d{8}$/.test(phone)){ setMsg('Ingresa un número de WhatsApp peruano válido de 9 dígitos.'); return; }
   if((documentType==='DNI'&&!/^\d{8}$/.test(documentNumber))||(documentType==='CE'&&!/^\d{6,12}$/.test(documentNumber))){setMsg('Ingresa un documento válido.');return;}
   if(!proof){ setMsg('Adjunta el comprobante de Yape.'); return; }
   if(proof.size > 5*1024*1024){ setMsg('El comprobante no puede superar 5 MB.'); return; }
@@ -274,12 +280,12 @@ async function submitOrder(){
     const waMessage =
       'CHAPA TU SUERTE - SOLICITUD DE COMPRA%0A%0A' +
       'Nombre: '+encodeURIComponent(name)+'%0A' +
-      'Celular: '+encodeURIComponent(phone)+'%0A' +
+      'Número de WhatsApp: '+encodeURIComponent(phone)+'%0A' +
       'Cantidad de tickets: '+data.quantity+'%0A' +
       'Total: S/'+data.total+'%0A' +
       'Código de solicitud: '+encodeURIComponent(data.order_code)+'%0A' +
       'Tickets asignados: '+encodeURIComponent(data.tickets.join(', '))+'%0A%0A' +
-      'Ya realicé el pago por Yape. Adjunto la captura del pago en este WhatsApp para validar la solicitud.';
+      'Ya registré mi compra y cargué el comprobante de Yape en la página. Solicito la confirmación de mi proceso de compra por este WhatsApp.';
 
     const waUrl='https://wa.me/'+waNumber+'?text='+waMessage;
     const waBtn=document.getElementById('whatsappBtn');
@@ -288,10 +294,7 @@ async function submitOrder(){
 
     document.getElementById('ticketResult').style.display='block';
     document.getElementById('ticketResult').scrollIntoView({behavior:'smooth',block:'center'});
-    setMsg('Solicitud generada. Ahora se abrirá WhatsApp para enviar tus datos.',true);
-
-    // Abrir WhatsApp con los datos de la solicitud.
-    setTimeout(()=>{ window.open(waUrl,'_blank','noopener'); },250);
+    setMsg('Solicitud registrada. Pulsa el botón verde para solicitar la confirmación por WhatsApp.',true);
   }catch(e){ setMsg(e.message); }
 }
 
