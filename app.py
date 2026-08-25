@@ -139,14 +139,15 @@ def identity_dni():
 def create_order():
     cleanup_expired()
     name=(request.form.get("name") or "").strip()
-    phone=(request.form.get("phone") or "").strip()
+    phone=re.sub(r"\D", "", request.form.get("phone") or "")
     document_type=(request.form.get("document_type") or "").strip().upper()
     document_number=(request.form.get("document_number") or "").strip()
     try: quantity=int(request.form.get("quantity","1"))
     except: quantity=0
     proof=request.files.get("proof")
     if not name or len(name)>120: return jsonify(error="Nombre inválido"),400
-    if not phone or len(phone)>30: return jsonify(error="Celular inválido"),400
+    if not re.fullmatch(r"9\d{8}", phone):
+        return jsonify(error="Número de WhatsApp inválido"),400
     if document_type not in {"DNI","CE"}: return jsonify(error="Tipo de documento inválido"),400
     if not document_number.isdigit(): return jsonify(error="Número de documento inválido"),400
     if document_type=="DNI" and len(document_number)!=8: return jsonify(error="El DNI debe tener 8 dígitos"),400
