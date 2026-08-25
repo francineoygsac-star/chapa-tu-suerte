@@ -8,8 +8,6 @@ from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory, make_response, redirect, session, send_file
 from google.cloud import storage
 from google.cloud import firestore
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 BASE = Path(__file__).resolve().parent
 PUBLIC = BASE / "public"
@@ -23,7 +21,10 @@ PRICE = 10
 JSONPE_TOKEN = os.environ.get("JSONPE_TOKEN", "").strip()
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "").strip()
 DNI_CACHE = {}
+DNI_CACHE_SECONDS = 90*24*60*60
 _FIRESTORE_DB = None
+_ADMIN_SESSION_CACHE = {}
+_LAST_EXPIRED_CLEANUP = 0
 
 def firestore_db():
     global _FIRESTORE_DB
@@ -43,7 +44,12 @@ def safe_filename_part(value):
 
 def cleanup_expired():
     """Libera reservas pendientes con más de 30 minutos."""
+    global _LAST_EXPIRED_CLEANUP
     now=int(time.time())
+    # Evita repetir la misma consulta de mantenimiento en cada carga del panel.
+    if now-_LAST_EXPIRED_CLEANUP < 60:
+        return
+    _LAST_EXPIRED_CLEANUP=now
     cutoff=now-1800
     pending=firestore_db().collection("orders").where("status", "==", "pending").limit(200).stream()
     for snapshot in pending:
@@ -68,9 +74,16 @@ def admin_required(fn):
     def wrapper(*args, **kwargs):
         token=request.cookies.get("admin_session")
         if not token: return jsonify(error="No autorizado"),401
-        snapshot=firestore_db().collection("admin_sessions").document(token).get()
-        if not snapshot.exists or int((snapshot.to_dict() or {}).get("created_at",0)) <= int(time.time())-86400:
-            return jsonify(error="No autorizado"),401
+        now=int(time.time())
+        cached_until=_ADMIN_SESSION_CACHE.get(token,0)
+        if cached_until <= now:
+            snapshot=firestore_db().collection("admin_sessions").document(token).get()
+            if not snapshot.exists or int((snapshot.to_dict() or {}).get("created_at",0)) <= now-86400:
+                _ADMIN_SESSION_CACHE.pop(token,None)
+                return jsonify(error="No autorizado"),401
+            # La cookie sigue siendo la autoridad; este caché solo ahorra lecturas
+            # repetidas durante cinco minutos dentro de la misma instancia.
+            _ADMIN_SESSION_CACHE[token]=now+300
         return fn(*args, **kwargs)
     return wrapper
 
@@ -90,7 +103,27 @@ def identity_dni():
 
     cached=DNI_CACHE.get(dni)
     if cached:
-        return jsonify(success=True, data=cached, cached=True)
+        return jsonify(success=True, data=cached, cached=True, cache_source="memory")
+
+    # Caché permanente: sobrevive a suspensiones, reinicios y despliegues de Render.
+    now=int(time.time())
+    cache_ref=firestore_db().collection("dni_cache").document(dni)
+    try:
+        cache_snapshot=cache_ref.get()
+        if cache_snapshot.exists:
+            saved=cache_snapshot.to_dict() or {}
+            if (int(saved.get("updated_at",0)) >= now-DNI_CACHE_SECONDS
+                    and str(saved.get("nombre_completo") or "").strip()):
+                clean={key:saved.get(key) for key in (
+                    "numero","nombres","apellido_paterno","apellido_materno",
+                    "nombre_completo","codigo_verificacion"
+                )}
+                clean["numero"]=dni
+                DNI_CACHE[dni]=clean
+                return jsonify(success=True,data=clean,cached=True,cache_source="firestore")
+    except Exception:
+        # Si el caché no está disponible, la validación oficial todavía puede continuar.
+        pass
 
     payload=json.dumps({"dni":dni}).encode("utf-8")
     req=urllib.request.Request(
@@ -137,7 +170,12 @@ def identity_dni():
         "codigo_verificacion": data.get("codigo_verificacion"),
     }
     DNI_CACHE[dni]=clean
-    return jsonify(success=True, data=clean, cached=False)
+    try:
+        cache_ref.set({**clean,"updated_at":now})
+    except Exception:
+        # No se invalida una consulta oficial exitosa por un fallo al guardar el caché.
+        pass
+    return jsonify(success=True, data=clean, cached=False, cache_source="jsonpe")
 
 
 @app.post("/api/orders")
@@ -280,6 +318,7 @@ def login():
         return jsonify(error="Credenciales incorrectas"),401
     token=secrets.token_urlsafe(32)
     firestore_db().collection("admin_sessions").document(token).set({"created_at":int(time.time())})
+    _ADMIN_SESSION_CACHE[token]=int(time.time())+300
     r=jsonify(ok=True); r.set_cookie("admin_session",token,httponly=True,samesite="Lax",secure=bool(os.environ.get("COOKIE_SECURE")),max_age=86400)
     return r
 
@@ -287,6 +326,7 @@ def login():
 def logout():
     token=request.cookies.get("admin_session")
     if token:
+        _ADMIN_SESSION_CACHE.pop(token,None)
         firestore_db().collection("admin_sessions").document(token).delete()
     r=jsonify(ok=True); r.delete_cookie("admin_session"); return r
 
@@ -308,6 +348,10 @@ def admin_orders():
 @app.get("/api/admin/export.xlsx")
 @admin_required
 def export_admin_excel():
+    # Estas librerías son pesadas; se cargan solo cuando se descarga el Excel,
+    # no durante el arranque normal de la web ni del panel.
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     rows=[snapshot.to_dict() for snapshot in firestore_db().collection("orders").stream()]
     rows.sort(key=lambda row:int(row.get("created_at",0)), reverse=True)
     status_labels={"pending":"Pendiente","approved":"Aprobada","rejected":"Rechazada","expired":"Vencida"}
@@ -460,7 +504,8 @@ def proof(filename):
         raw=blob.download_as_bytes()
         response=make_response(raw)
         response.headers["Content-Type"]=blob.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        response.headers["Cache-Control"]="private, no-store"
+        # Permite que el navegador reutilice el comprobante durante la sesión.
+        response.headers["Cache-Control"]="private, max-age=300"
         return response
     except Exception:
         return "No se pudo cargar el comprobante",404

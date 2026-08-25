@@ -2,7 +2,7 @@
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Administración · Chapa Tu Suerte</title>
 <style>
-body{font-family:Arial;margin:0;background:#07070b;color:#fff}.wrap{max-width:1200px;margin:auto;padding:24px}.card{background:#12121a;border:1px solid #2a2a33;border-radius:16px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}.stat{padding:16px;border-radius:14px;background:#1a1a23}.stat b{display:block;font-size:28px;color:#ffd400}button{border:0;border-radius:9px;padding:10px 14px;font-weight:900;cursor:pointer}.approve{background:#16a66a;color:#fff}.reject{background:#d9273f;color:#fff}.login{max-width:420px;margin:10vh auto}.field{margin:12px 0}.field label{display:block;margin-bottom:6px;font-weight:800}.field input{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#0c0c11;color:#fff;box-sizing:border-box}.toolbar{display:flex;gap:8px;flex-wrap:wrap}.order{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:start}.badge{display:inline-block;padding:5px 8px;border-radius:999px;background:#292934;font-size:12px}.tickets{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.ticket{background:#0a7c4b;padding:6px 9px;border-radius:999px;font-weight:900}.proof{max-width:180px;max-height:180px;border-radius:10px;display:block;margin-top:8px}@media(max-width:800px){.grid{grid-template-columns:repeat(2,1fr)}.order{grid-template-columns:1fr}}
+body{font-family:Arial;margin:0;background:#07070b;color:#fff}.wrap{max-width:1200px;margin:auto;padding:24px}.card{background:#12121a;border:1px solid #2a2a33;border-radius:16px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}.stat{padding:16px;border-radius:14px;background:#1a1a23}.stat b{display:block;font-size:28px;color:#ffd400}button{border:0;border-radius:9px;padding:10px 14px;font-weight:900;cursor:pointer}.approve{background:#16a66a;color:#fff}.reject{background:#d9273f;color:#fff}.login{max-width:420px;margin:10vh auto}.field{margin:12px 0}.field label{display:block;margin-bottom:6px;font-weight:800}.field input{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#0c0c11;color:#fff;box-sizing:border-box}.toolbar{display:flex;gap:8px;flex-wrap:wrap}.order{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:start}.badge{display:inline-block;padding:5px 8px;border-radius:999px;background:#292934;font-size:12px}.tickets{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.ticket{background:#0a7c4b;padding:6px 9px;border-radius:999px;font-weight:900}.proof{width:180px;height:180px;object-fit:cover;border-radius:10px;display:block;margin-top:8px;background:#20202a}.loading{padding:28px;text-align:center;color:#c9c9d2}.proof-wrap{display:inline-block;min-height:180px}@media(max-width:800px){.grid{grid-template-columns:repeat(2,1fr)}.order{grid-template-columns:1fr}.proof{width:150px;height:150px}}
 </style></head><body><div class="wrap">
 <div id="login" class="card login"><h1>Panel de administración</h1><p>Chapa Tu Suerte</p>
 <div class="field"><label>Usuario</label><input id="u" value="admin"></div>
@@ -17,7 +17,28 @@ async function login(){let r=await fetch('/admin/login',{method:'POST',headers:{
 async function logout(){await fetch('/admin/logout',{method:'POST'});location.reload()}
 function downloadExcel(){window.location.href='/api/admin/export.xlsx'}
 async function stats(){let r=await fetch('/api/admin/stats');if(!r.ok)return;let d=await r.json();document.getElementById('stats').innerHTML=[['Pendientes',d.pending],['Aprobadas',d.approved],['Rechazadas',d.rejected],['Tickets confirmados',d.confirmed_tickets],['Ventas aprobadas','S/'+d.sales_approved]].map(x=>'<div class="stat">'+x[0]+'<b>'+x[1]+'</b></div>').join('')}
-async function load(status){let r=await fetch('/api/admin/orders?status='+status);if(r.status===401){document.getElementById('login').style.display='block';document.getElementById('app').style.display='none';return}let d=await r.json();document.getElementById('orders').innerHTML=d.orders.map(o=>'<div class="card order"><div><h2>'+o.code+' <span class="badge">'+o.status.toUpperCase()+'</span></h2><p><b>'+esc(o.name)+'</b> · '+esc(o.phone)+' · '+o.quantity+' ticket(s) · S/'+o.total+'</p><p>Creado: '+o.created_at+'</p><div class="tickets">'+o.tickets.map(t=>'<span class="ticket">#'+t+'</span>').join('')+'</div>'+(o.proof_url?'<a href="'+o.proof_url+'" target="_blank"><img class="proof" src="'+o.proof_url+'"></a>':'')+'</div><div>'+ (o.status==='pending'?'<button class="approve" onclick="act('+o.id+',\'approve\')">APROBAR PAGO</button> <button class="reject" onclick="act('+o.id+',\'reject\')">RECHAZAR</button>':o.status==='expired'?'<button class="approve" onclick="act('+o.id+',\'approve\')">VALIDAR PAGO VENCIDO</button>':'<span class="badge">'+(o.review_note||'Procesado')+'</span>')+'</div></div>').join('')}
+let proofObserver;
+function activateProofs(){
+  if(proofObserver)proofObserver.disconnect();
+  proofObserver=new IntersectionObserver(entries=>entries.forEach(entry=>{
+    if(!entry.isIntersecting)return;
+    const img=entry.target;
+    img.src=img.dataset.src;
+    img.removeAttribute('data-src');
+    proofObserver.unobserve(img);
+  }),{rootMargin:'300px 0px'});
+  document.querySelectorAll('img[data-src]').forEach(img=>proofObserver.observe(img));
+}
+async function load(status){
+  const container=document.getElementById('orders');
+  container.innerHTML='<div class="loading">Cargando solicitudes y comprobantes…</div>';
+  let r=await fetch('/api/admin/orders?status='+encodeURIComponent(status));
+  if(r.status===401){document.getElementById('login').style.display='block';document.getElementById('app').style.display='none';return}
+  let d=await r.json();
+  container.innerHTML=d.orders.map(o=>'<div class="card order"><div><h2>'+esc(o.code)+' <span class="badge">'+esc(o.status.toUpperCase())+'</span></h2><p><b>'+esc(o.name)+'</b> · '+esc(o.phone)+' · '+o.quantity+' ticket(s) · S/'+o.total+'</p><p>Creado: '+esc(o.created_at)+'</p><div class="tickets">'+o.tickets.map(t=>'<span class="ticket">#'+t+'</span>').join('')+'</div>'+(o.proof_url?'<a class="proof-wrap" href="'+encodeURI(o.proof_url)+'" target="_blank" title="Abrir comprobante completo"><img class="proof" data-src="'+encodeURI(o.proof_url)+'" alt="Comprobante de '+esc(o.code)+'" loading="lazy" decoding="async"></a>':'')+'</div><div>'+ (o.status==='pending'?'<button class="approve" onclick="act('+o.id+',\'approve\')">APROBAR PAGO</button> <button class="reject" onclick="act('+o.id+',\'reject\')">RECHAZAR</button>':o.status==='expired'?'<button class="approve" onclick="act('+o.id+',\'approve\')">VALIDAR PAGO VENCIDO</button>':'<span class="badge">'+esc(o.review_note||'Procesado')+'</span>')+'</div></div>').join('');
+  if(!d.orders.length)container.innerHTML='<div class="loading">No hay solicitudes en esta categoría.</div>';
+  activateProofs();
+}
 async function act(id,a){let note=prompt(a==='approve'?'Nota de aprobación (opcional):':'Motivo del rechazo (opcional):')||'';let r=await fetch('/api/admin/orders/'+id+'/'+a,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({note})});let d=await r.json();if(!r.ok){alert(d.error);return}if(d.message)alert(d.message+(d.replacements&&d.replacements.length?'\nTickets confirmados: '+d.tickets.join(', '):''));load('pending');stats()}
 function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
 </script></body></html>
