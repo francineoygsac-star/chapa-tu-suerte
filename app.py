@@ -1,15 +1,13 @@
 
-import os, sqlite3, secrets, hashlib, hmac, time, mimetypes, json, urllib.request, urllib.error, re, unicodedata
+import os, secrets, hmac, time, mimetypes, json, urllib.request, urllib.error, re, unicodedata
 from pathlib import Path
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory, make_response, redirect, session
 from google.cloud import storage
+from google.cloud import firestore
 
 BASE = Path(__file__).resolve().parent
-DB = BASE / "data.sqlite3"
-UPLOADS = BASE / "uploads"
 PUBLIC = BASE / "public"
-UPLOADS.mkdir(exist_ok=True)
 
 app = Flask(__name__, static_folder=str(PUBLIC), static_url_path="")
 app.secret_key = os.environ.get("FLASK_SECRET", "CHANGE_THIS_SECRET_IN_PRODUCTION")
@@ -20,6 +18,13 @@ PRICE = 10
 JSONPE_TOKEN = os.environ.get("JSONPE_TOKEN", "").strip()
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "").strip()
 DNI_CACHE = {}
+_FIRESTORE_DB = None
+
+def firestore_db():
+    global _FIRESTORE_DB
+    if _FIRESTORE_DB is None:
+        _FIRESTORE_DB = firestore.Client(database="(default)")
+    return _FIRESTORE_DB
 
 def storage_bucket():
     if not GCS_BUCKET_NAME:
@@ -31,87 +36,36 @@ def safe_filename_part(value):
     value=re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
     return value[:60] or "SIN_NOMBRE"
 
-def db():
-    c=sqlite3.connect(DB)
-    c.row_factory=sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    return c
-
-def init_db():
-    c=db()
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS orders(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      code TEXT UNIQUE NOT NULL,
-      name TEXT NOT NULL,
-      phone TEXT NOT NULL,
-      document_type TEXT,
-      document_number TEXT,
-      quantity INTEGER NOT NULL CHECK(quantity BETWEEN 1 AND 50),
-      total INTEGER NOT NULL,
-      proof_path TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      reviewed_at TEXT,
-      review_note TEXT
-    );
-    CREATE TABLE IF NOT EXISTS tickets(
-      number INTEGER PRIMARY KEY,
-      order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-      status TEXT NOT NULL DEFAULT 'reserved',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(number)
-    );
-    CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
-    CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
-    CREATE TABLE IF NOT EXISTS admin_sessions(
-      token TEXT PRIMARY KEY,
-      created_at INTEGER NOT NULL
-    );
-    """)
-    columns={row["name"] for row in c.execute("PRAGMA table_info(orders)").fetchall()}
-    if "document_type" not in columns: c.execute("ALTER TABLE orders ADD COLUMN document_type TEXT")
-    if "document_number" not in columns: c.execute("ALTER TABLE orders ADD COLUMN document_number TEXT")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_orders_document ON orders(document_type, document_number)")
-    c.commit(); c.close()
-
 def cleanup_expired():
-    # Pending reservations older than 30 minutes are released.
-    c=db()
-    c.execute("""
-      UPDATE orders SET status='expired', reviewed_at=datetime('now'), review_note='Reserva vencida'
-      WHERE status='pending' AND datetime(created_at) < datetime('now','-30 minutes')
-    """)
-    c.execute("""
-      DELETE FROM tickets WHERE order_id IN (SELECT id FROM orders WHERE status='expired')
-    """)
-    c.commit(); c.close()
+    """Libera reservas pendientes con más de 30 minutos."""
+    now=int(time.time())
+    cutoff=now-1800
+    pending=firestore_db().collection("orders").where("status", "==", "pending").limit(200).stream()
+    for snapshot in pending:
+        order=snapshot.to_dict()
+        if int(order.get("created_at", now)) >= cutoff:
+            continue
+        batch=firestore_db().batch()
+        batch.update(snapshot.reference, {
+            "status":"expired", "reviewed_at":now,
+            "reviewed_at_text":time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now)),
+            "review_note":"Reserva vencida", "released_tickets":order.get("tickets",[]), "tickets":[],
+        })
+        for number in order.get("tickets", []):
+            batch.delete(firestore_db().collection("tickets").document(str(number)))
+        batch.commit()
 
 def make_code():
     return "CTS-" + secrets.token_hex(4).upper()
-
-def allocate_numbers(c, quantity):
-    nums=[]
-    # Random 6-digit tickets, uniqueness enforced by the database.
-    while len(nums)<quantity:
-        n=secrets.randbelow(900000)+100000
-        try:
-            c.execute("INSERT INTO tickets(number,order_id,status) VALUES(?,?,?)",(n,-1,'temp'))
-            c.execute("DELETE FROM tickets WHERE number=?",(n,))
-            nums.append(n)
-        except sqlite3.IntegrityError:
-            pass
-    return nums
 
 def admin_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         token=request.cookies.get("admin_session")
         if not token: return jsonify(error="No autorizado"),401
-        c=db()
-        row=c.execute("SELECT token FROM admin_sessions WHERE token=? AND created_at>?",(token,int(time.time())-86400)).fetchone()
-        c.close()
-        if not row: return jsonify(error="No autorizado"),401
+        snapshot=firestore_db().collection("admin_sessions").document(token).get()
+        if not snapshot.exists or int((snapshot.to_dict() or {}).get("created_at",0)) <= int(time.time())-86400:
+            return jsonify(error="No autorizado"),401
         return fn(*args, **kwargs)
     return wrapper
 
@@ -203,23 +157,47 @@ def create_order():
     raw=proof.read()
     if len(raw)>5*1024*1024: return jsonify(error="Comprobante demasiado grande"),400
 
-    c=db()
+    code=make_code()
+    oid=str(int(time.time()*1000)*100+secrets.randbelow(100))
+    now=int(time.time())
+    created_at_text=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now))
+    orders=firestore_db().collection("orders")
+    tickets=firestore_db().collection("tickets")
+    nums=[]
     try:
-        c.execute("BEGIN IMMEDIATE")
-        code=make_code()
-        while c.execute("SELECT 1 FROM orders WHERE code=?",(code,)).fetchone(): code=make_code()
-        c.execute("INSERT INTO orders(code,name,phone,document_type,document_number,quantity,total) VALUES(?,?,?,?,?,?,?)",
-                  (code,name,phone,document_type,document_number,quantity,quantity*PRICE))
-        oid=c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # Reserva todos los números y crea la solicitud en una sola transacción.
+        for _ in range(12):
+            candidates=[]
+            while len(candidates)<quantity:
+                n=secrets.randbelow(900000)+100000
+                if n not in candidates: candidates.append(n)
 
-        nums=[]
-        while len(nums)<quantity:
-            n=secrets.randbelow(900000)+100000
-            try:
-                c.execute("INSERT INTO tickets(number,order_id,status) VALUES(?,?,?)",(n,oid,'reserved'))
-                nums.append(n)
-            except sqlite3.IntegrityError:
-                continue
+            transaction=firestore_db().transaction()
+            @firestore.transactional
+            def reserve(transaction):
+                refs=[tickets.document(str(n)) for n in candidates]
+                snapshots=[ref.get(transaction=transaction) for ref in refs]
+                if any(snapshot.exists for snapshot in snapshots):
+                    return False
+                transaction.set(orders.document(oid), {
+                    "id":oid, "code":code, "name":name, "phone":phone,
+                    "document_type":document_type, "document_number":document_number,
+                    "quantity":quantity, "total":quantity*PRICE,
+                    "proof_path":None, "status":"pending", "tickets":candidates,
+                    "created_at":now, "created_at_text":created_at_text,
+                    "reviewed_at":None, "reviewed_at_text":None, "review_note":None,
+                })
+                for ref,n in zip(refs,candidates):
+                    transaction.set(ref, {
+                        "number":n, "order_id":oid, "order_code":code,
+                        "status":"reserved", "created_at":now,
+                    })
+                return True
+            if reserve(transaction):
+                nums=candidates
+                break
+        if not nums:
+            raise RuntimeError("No se pudieron reservar números únicos")
 
         ext={ "image/jpeg":".jpg","image/png":".png","image/webp":".webp"}[proof.mimetype]
         timestamp=time.strftime("%Y%m%d_%H%M%S", time.gmtime())
@@ -227,30 +205,35 @@ def create_order():
                   f"{timestamp}_{code}{ext}")
         blob=storage_bucket().blob(filename)
         blob.upload_from_string(raw, content_type=proof.mimetype)
-        c.execute("UPDATE orders SET proof_path=? WHERE id=?",(filename,oid))
-        c.commit()
+        orders.document(oid).update({"proof_path":filename})
     except Exception:
-        c.rollback(); c.close()
+        # Si falla la imagen, libera la reserva para no dejar tickets bloqueados.
+        if nums:
+            batch=firestore_db().batch()
+            batch.delete(orders.document(oid))
+            for number in nums:
+                batch.delete(tickets.document(str(number)))
+            batch.commit()
         return jsonify(error="No se pudo crear la solicitud"),500
-    c.close()
     return jsonify(order_code=code,quantity=quantity,total=quantity*PRICE,tickets=nums,status="pending"),201
 
 @app.get("/api/tickets/<number>")
 def ticket(number):
     if not number.isdigit() or len(number)!=6: return jsonify(error="Número inválido"),400
-    c=db()
-    row=c.execute("""SELECT t.number,o.name,t.status,o.status AS order_status
-                    FROM tickets t JOIN orders o ON o.id=t.order_id WHERE t.number=?""",(int(number),)).fetchone()
-    c.close()
-    if not row: return jsonify(error="No encontrado"),404
+    ticket_snapshot=firestore_db().collection("tickets").document(number).get()
+    if not ticket_snapshot.exists: return jsonify(error="No encontrado"),404
+    ticket_data=ticket_snapshot.to_dict()
+    order_snapshot=firestore_db().collection("orders").document(ticket_data["order_id"]).get()
+    if not order_snapshot.exists: return jsonify(error="No encontrado"),404
+    order=order_snapshot.to_dict()
     status_map={
       ("reserved","pending"):("RESERVADO · PENDIENTE DE PAGO/VALIDACIÓN"),
       ("reserved","expired"):("RESERVA VENCIDA"),
       ("reserved","rejected"):("RECHAZADO"),
       ("confirmed","approved"):("CONFIRMADO"),
     }
-    label=status_map.get((row["status"],row["order_status"]),"EN REVISIÓN")
-    return jsonify(number=row["number"],name=row["name"],status_label=label)
+    label=status_map.get((ticket_data["status"],order["status"]),"EN REVISIÓN")
+    return jsonify(number=ticket_data["number"],name=order["name"],status_label=label)
 
 
 @app.get("/api/tickets/by-document")
@@ -263,24 +246,24 @@ def tickets_by_document():
         return jsonify(error="El DNI debe tener 8 dígitos"),400
     if document_type=="CE" and not 6<=len(document_number)<=12:
         return jsonify(error="El Carnet de Extranjería debe tener entre 6 y 12 dígitos"),400
-    cleanup_expired(); c=db()
-    rows=c.execute("""SELECT o.id,o.code,o.name,o.document_type,o.document_number,o.quantity,o.total,
-                             o.status AS order_status,o.created_at,t.number,t.status AS ticket_status
-                      FROM orders o LEFT JOIN tickets t ON t.order_id=o.id
-                      WHERE o.document_type=? AND o.document_number=?
-                      ORDER BY o.id DESC,t.number ASC""",(document_type,document_number)).fetchall()
-    c.close()
-    if not rows: return jsonify(error="No se encontraron tickets para ese documento"),404
-    orders={}
+    cleanup_expired()
+    snapshots=firestore_db().collection("orders").where("document_number", "==", document_number).limit(200).stream()
+    orders=[snapshot.to_dict() for snapshot in snapshots]
+    orders=[o for o in orders if o.get("document_type")==document_type]
+    if not orders: return jsonify(error="No se encontraron tickets para ese documento"),404
     labels={"pending":"PENDIENTE DE VALIDACIÓN","approved":"CONFIRMADO","rejected":"RECHAZADO","expired":"RESERVA VENCIDA"}
-    for r in rows:
-        orders.setdefault(r["id"],{"order_code":r["code"],"name":r["name"],"document_type":r["document_type"],
-          "document_number":r["document_number"],"quantity":r["quantity"],"total":r["total"],
-          "status":r["order_status"],"status_label":labels.get(r["order_status"],"EN REVISIÓN"),
-          "created_at":r["created_at"],"tickets":[]})
-        if r["number"] is not None:
-            orders[r["id"]]["tickets"].append({"number":r["number"],"status":r["ticket_status"]})
-    result=list(orders.values())
+    orders.sort(key=lambda o:int(o.get("created_at",0)), reverse=True)
+    result=[]
+    for order in orders:
+        ticket_status="confirmed" if order.get("status")=="approved" else "reserved"
+        result.append({
+            "order_code":order["code"], "name":order["name"],
+            "document_type":order["document_type"], "document_number":order["document_number"],
+            "quantity":order["quantity"], "total":order["total"],
+            "status":order["status"], "status_label":labels.get(order["status"],"EN REVISIÓN"),
+            "created_at":order.get("created_at_text",""),
+            "tickets":[{"number":n,"status":ticket_status} for n in sorted(order.get("tickets",[]))]
+        })
     return jsonify(document_type=document_type,document_number=document_number,total_orders=len(result),
                    total_tickets=sum(len(x["tickets"]) for x in result),orders=result)
 
@@ -290,7 +273,7 @@ def login():
     if data.get("username")!=ADMIN_USER or not hmac.compare_digest(str(data.get("password","")),ADMIN_PASSWORD):
         return jsonify(error="Credenciales incorrectas"),401
     token=secrets.token_urlsafe(32)
-    c=db(); c.execute("INSERT INTO admin_sessions(token,created_at) VALUES(?,?)",(token,int(time.time()))); c.commit(); c.close()
+    firestore_db().collection("admin_sessions").document(token).set({"created_at":int(time.time())})
     r=jsonify(ok=True); r.set_cookie("admin_session",token,httponly=True,samesite="Lax",secure=bool(os.environ.get("COOKIE_SECURE")),max_age=86400)
     return r
 
@@ -298,7 +281,7 @@ def login():
 def logout():
     token=request.cookies.get("admin_session")
     if token:
-        c=db(); c.execute("DELETE FROM admin_sessions WHERE token=?",(token,)); c.commit(); c.close()
+        firestore_db().collection("admin_sessions").document(token).delete()
     r=jsonify(ok=True); r.delete_cookie("admin_session"); return r
 
 @app.get("/api/admin/orders")
@@ -306,18 +289,14 @@ def logout():
 def admin_orders():
     cleanup_expired()
     status=request.args.get("status","all")
-    c=db()
-    q="""SELECT id,code,name,phone,quantity,total,status,proof_path,created_at,reviewed_at,review_note
-         FROM orders"""
-    args=[]
-    if status!="all":
-        q+=" WHERE status=?"; args.append(status)
-    q+=" ORDER BY id DESC LIMIT 200"
-    rows=[dict(x) for x in c.execute(q,args).fetchall()]
-    for r in rows:
-        r["tickets"]=[x["number"] for x in c.execute("SELECT number FROM tickets WHERE order_id=? ORDER BY number",(r["id"],)).fetchall()]
-        r["proof_url"]="/admin/proof/"+r["proof_path"] if r["proof_path"] else None
-    c.close()
+    query=firestore_db().collection("orders")
+    if status!="all": query=query.where("status", "==", status)
+    rows=[snapshot.to_dict() for snapshot in query.limit(200).stream()]
+    rows.sort(key=lambda row:int(row.get("created_at",0)), reverse=True)
+    for row in rows:
+        row["created_at"]=row.get("created_at_text","")
+        row["tickets"]=sorted(row.get("tickets",[]))
+        row["proof_url"]="/admin/proof/"+row["proof_path"] if row.get("proof_path") else None
     return jsonify(orders=rows)
 
 @app.get("/admin/proof/<filename>")
@@ -335,45 +314,59 @@ def proof(filename):
     except Exception:
         return "No se pudo cargar el comprobante",404
 
-@app.post("/api/admin/orders/<int:oid>/approve")
+@app.post("/api/admin/orders/<oid>/approve")
 @admin_required
 def approve(oid):
-    c=db(); row=c.execute("SELECT * FROM orders WHERE id=?",(oid,)).fetchone()
-    if not row: c.close(); return jsonify(error="No encontrado"),404
-    if row["status"]!="pending": c.close(); return jsonify(error="La solicitud ya fue procesada"),400
-    c.execute("UPDATE orders SET status='approved',reviewed_at=datetime('now'),review_note=? WHERE id=?",((request.json or {}).get("note","Pago validado"),oid))
-    c.execute("UPDATE tickets SET status='confirmed' WHERE order_id=?",(oid,))
-    c.commit(); c.close()
+    ref=firestore_db().collection("orders").document(oid)
+    snapshot=ref.get()
+    if not snapshot.exists: return jsonify(error="No encontrado"),404
+    order=snapshot.to_dict()
+    if order["status"]!="pending": return jsonify(error="La solicitud ya fue procesada"),400
+    now=int(time.time())
+    batch=firestore_db().batch()
+    batch.update(ref, {"status":"approved", "reviewed_at":now,
+                       "reviewed_at_text":time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(now)),
+                       "review_note":(request.json or {}).get("note") or "Pago validado"})
+    for number in order.get("tickets",[]):
+        batch.update(firestore_db().collection("tickets").document(str(number)), {"status":"confirmed"})
+    batch.commit()
     return jsonify(ok=True)
 
-@app.post("/api/admin/orders/<int:oid>/reject")
+@app.post("/api/admin/orders/<oid>/reject")
 @admin_required
 def reject(oid):
-    c=db(); row=c.execute("SELECT * FROM orders WHERE id=?",(oid,)).fetchone()
-    if not row: c.close(); return jsonify(error="No encontrado"),404
-    if row["status"]!="pending": c.close(); return jsonify(error="La solicitud ya fue procesada"),400
-    c.execute("UPDATE orders SET status='rejected',reviewed_at=datetime('now'),review_note=? WHERE id=?",((request.json or {}).get("note","Pago rechazado"),oid))
-    c.execute("DELETE FROM tickets WHERE order_id=?",(oid,))
-    c.commit(); c.close()
+    ref=firestore_db().collection("orders").document(oid)
+    snapshot=ref.get()
+    if not snapshot.exists: return jsonify(error="No encontrado"),404
+    order=snapshot.to_dict()
+    if order["status"]!="pending": return jsonify(error="La solicitud ya fue procesada"),400
+    now=int(time.time())
+    batch=firestore_db().batch()
+    batch.update(ref, {"status":"rejected", "reviewed_at":now,
+                       "reviewed_at_text":time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(now)),
+                       "review_note":(request.json or {}).get("note") or "Pago rechazado",
+                       "released_tickets":order.get("tickets",[]), "tickets":[]})
+    for number in order.get("tickets",[]):
+        batch.delete(firestore_db().collection("tickets").document(str(number)))
+    batch.commit()
     return jsonify(ok=True)
 
 @app.get("/api/admin/stats")
 @admin_required
 def stats():
-    c=db()
-    out={}
-    for s in ("pending","approved","rejected","expired"):
-        out[s]=c.execute("SELECT COUNT(*) FROM orders WHERE status=?",(s,)).fetchone()[0]
-    out["confirmed_tickets"]=c.execute("SELECT COUNT(*) FROM tickets WHERE status='confirmed'").fetchone()[0]
-    out["reserved_tickets"]=c.execute("SELECT COUNT(*) FROM tickets WHERE status='reserved'").fetchone()[0]
-    out["sales_approved"]=c.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE status='approved'").fetchone()[0]
-    c.close(); return jsonify(out)
+    rows=[snapshot.to_dict() for snapshot in firestore_db().collection("orders").stream()]
+    out={status:sum(1 for row in rows if row.get("status")==status)
+         for status in ("pending","approved","rejected","expired")}
+    approved=[row for row in rows if row.get("status")=="approved"]
+    pending=[row for row in rows if row.get("status")=="pending"]
+    out["confirmed_tickets"]=sum(int(row.get("quantity",0)) for row in approved)
+    out["reserved_tickets"]=sum(int(row.get("quantity",0)) for row in pending)
+    out["sales_approved"]=sum(int(row.get("total",0)) for row in approved)
+    return jsonify(out)
 
 @app.get("/admin")
 def admin_page():
     return send_from_directory(BASE,"admin.html")
-
-init_db()
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.environ.get("PORT",5000)),debug=False)
