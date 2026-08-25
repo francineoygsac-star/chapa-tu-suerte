@@ -1,10 +1,16 @@
 
 import os, secrets, hmac, time, mimetypes, json, urllib.request, urllib.error, re, unicodedata
+from io import BytesIO
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from functools import wraps
-from flask import Flask, request, jsonify, send_from_directory, make_response, redirect, session
+from flask import Flask, request, jsonify, send_from_directory, make_response, redirect, session, send_file
 from google.cloud import storage
 from google.cloud import firestore
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 BASE = Path(__file__).resolve().parent
 PUBLIC = BASE / "public"
@@ -299,6 +305,100 @@ def admin_orders():
         row["tickets"]=sorted(row.get("tickets",[]) or row.get("released_tickets",[]))
         row["proof_url"]="/admin/proof/"+row["proof_path"] if row.get("proof_path") else None
     return jsonify(orders=rows)
+
+@app.get("/api/admin/export.xlsx")
+@admin_required
+def export_admin_excel():
+    rows=[snapshot.to_dict() for snapshot in firestore_db().collection("orders").stream()]
+    rows.sort(key=lambda row:int(row.get("created_at",0)), reverse=True)
+    status_labels={"pending":"Pendiente","approved":"Aprobada","rejected":"Rechazada","expired":"Vencida"}
+    lima=ZoneInfo("America/Lima")
+
+    def local_datetime(timestamp):
+        if not timestamp: return None
+        return datetime.fromtimestamp(int(timestamp),timezone.utc).astimezone(lima).replace(tzinfo=None)
+
+    def safe_excel_text(value):
+        text=str(value or "")
+        return "'"+text if text.startswith(("=","+","-","@")) else text
+
+    workbook=Workbook()
+    summary=workbook.active
+    summary.title="Resumen"
+    detail=workbook.create_sheet("Participantes y pagos")
+    yellow="FFD400"; dark="111117"; green="16A66A"; white="FFFFFF"; light="F2F2F2"
+    thin=Side(style="thin",color="D9D9D9")
+
+    summary.merge_cells("A1:D1")
+    summary["A1"]="CHAPA TU SUERTE — REPORTE ADMINISTRATIVO"
+    summary["A1"].font=Font(bold=True,size=16,color=white)
+    summary["A1"].fill=PatternFill("solid",fgColor=dark)
+    summary["A1"].alignment=Alignment(horizontal="center")
+    summary.append(["Indicador","Valor"])
+    approved=[row for row in rows if row.get("status")=="approved"]
+    indicators=[
+        ("Total de solicitudes",len(rows)),
+        ("Pendientes",sum(row.get("status")=="pending" for row in rows)),
+        ("Aprobadas",len(approved)),
+        ("Rechazadas",sum(row.get("status")=="rejected" for row in rows)),
+        ("Vencidas",sum(row.get("status")=="expired" for row in rows)),
+        ("Tickets confirmados",sum(int(row.get("quantity",0)) for row in approved)),
+        ("Ventas aprobadas (S/)",sum(int(row.get("total",0)) for row in approved)),
+        ("Generado",datetime.now(lima).replace(tzinfo=None)),
+    ]
+    for indicator,value in indicators: summary.append([indicator,value])
+    for cell in summary[2]:
+        cell.font=Font(bold=True,color=dark); cell.fill=PatternFill("solid",fgColor=yellow)
+    summary["B10"].number_format='dd/mm/yyyy hh:mm'
+    summary.column_dimensions["A"].width=30; summary.column_dimensions["B"].width=22
+    summary.freeze_panes="A3"
+
+    headers=["Código de solicitud","Nombre completo","Número de WhatsApp","Tipo de documento",
+             "Número de documento","Cantidad","Total (S/)","Estado","Tickets confirmados/asignados",
+             "Tickets originales/liberados","Fecha de registro","Fecha de revisión","Observación",
+             "Reactivada desde vencida"]
+    detail.append(headers)
+    for row in rows:
+        current_tickets=row.get("tickets",[]) or []
+        historical=row.get("original_tickets",[]) or row.get("released_tickets",[]) or current_tickets
+        detail.append([
+            safe_excel_text(row.get("code")),safe_excel_text(row.get("name")),safe_excel_text(row.get("phone")),
+            safe_excel_text(row.get("document_type")),safe_excel_text(row.get("document_number")),
+            int(row.get("quantity",0)),int(row.get("total",0)),status_labels.get(row.get("status"),row.get("status","")),
+            ", ".join(str(number) for number in current_tickets),
+            ", ".join(str(number) for number in historical),
+            local_datetime(row.get("created_at")),local_datetime(row.get("reviewed_at")),
+            safe_excel_text(row.get("review_note")),"Sí" if row.get("reactivated_from_expired") else "No",
+        ])
+
+    for cell in detail[1]:
+        cell.font=Font(bold=True,color=white)
+        cell.fill=PatternFill("solid",fgColor=dark)
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+        cell.border=Border(bottom=thin)
+    for row in detail.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment=Alignment(vertical="top",wrap_text=True)
+            cell.border=Border(bottom=thin)
+        row[6].number_format='"S/" #,##0'
+        row[10].number_format='dd/mm/yyyy hh:mm'
+        row[11].number_format='dd/mm/yyyy hh:mm'
+    widths=[20,32,20,18,20,12,14,16,30,30,21,21,48,23]
+    for index,width in enumerate(widths,1):
+        detail.column_dimensions[chr(64+index)].width=width
+    detail.freeze_panes="A2"
+    detail.auto_filter.ref=f"A1:N{max(detail.max_row,1)}"
+    if detail.max_row>1:
+        table=Table(displayName="TablaParticipantes",ref=f"A1:N{detail.max_row}")
+        table.tableStyleInfo=TableStyleInfo(name="TableStyleMedium4",showRowStripes=True,showColumnStripes=False)
+        detail.add_table(table)
+
+    output=BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    filename="chapa-tu-suerte-participantes-"+datetime.now(lima).strftime("%Y%m%d-%H%M")+".xlsx"
+    return send_file(output,as_attachment=True,download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 @app.get("/admin/proof/<filename>")
 @admin_required
