@@ -10,7 +10,6 @@ from google.cloud import storage
 from google.cloud import firestore
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.worksheet.table import Table, TableStyleInfo
 
 BASE = Path(__file__).resolve().parent
 PUBLIC = BASE / "public"
@@ -326,32 +325,78 @@ def export_admin_excel():
     summary=workbook.active
     summary.title="Resumen"
     detail=workbook.create_sheet("Participantes y pagos")
-    yellow="FFD400"; dark="111117"; green="16A66A"; white="FFFFFF"; light="F2F2F2"
+    yellow="FFD400"; dark="111117"; white="FFFFFF"; light="F2F2F2"
     thin=Side(style="thin",color="D9D9D9")
+    summary.sheet_view.showGridLines=False
+    detail.sheet_view.showGridLines=False
 
-    summary.merge_cells("A1:D1")
-    summary["A1"]="CHAPA TU SUERTE — REPORTE ADMINISTRATIVO"
-    summary["A1"].font=Font(bold=True,size=16,color=white)
-    summary["A1"].fill=PatternFill("solid",fgColor=dark)
-    summary["A1"].alignment=Alignment(horizontal="center")
-    summary.append(["Indicador","Valor"])
     approved=[row for row in rows if row.get("status")=="approved"]
-    indicators=[
-        ("Total de solicitudes",len(rows)),
-        ("Pendientes",sum(row.get("status")=="pending" for row in rows)),
-        ("Aprobadas",len(approved)),
-        ("Rechazadas",sum(row.get("status")=="rejected" for row in rows)),
-        ("Vencidas",sum(row.get("status")=="expired" for row in rows)),
-        ("Tickets confirmados",sum(int(row.get("quantity",0)) for row in approved)),
-        ("Ventas aprobadas (S/)",sum(int(row.get("total",0)) for row in approved)),
-        ("Generado",datetime.now(lima).replace(tzinfo=None)),
+    pending=[row for row in rows if row.get("status")=="pending"]
+    rejected=[row for row in rows if row.get("status")=="rejected"]
+    expired=[row for row in rows if row.get("status")=="expired"]
+    confirmed_tickets=sum(int(row.get("quantity",0)) for row in approved)
+    approved_sales=sum(int(row.get("total",0)) for row in approved)
+    reactivated=sum(bool(row.get("reactivated_from_expired")) for row in rows)
+
+    summary.merge_cells("A1:H2")
+    summary["A1"]="CHAPA TU SUERTE — REPORTE ADMINISTRATIVO"
+    summary["A1"].font=Font(name="Calibri",bold=True,size=20,color=white)
+    summary["A1"].fill=PatternFill("solid",fgColor=dark)
+    summary["A1"].alignment=Alignment(horizontal="center",vertical="center")
+    summary.merge_cells("A3:H3")
+    summary["A3"]="Generado el "+datetime.now(lima).strftime("%d/%m/%Y %H:%M")+" · Hora de Perú"
+    summary["A3"].font=Font(italic=True,color="D1D5DB")
+    summary["A3"].fill=PatternFill("solid",fgColor="24242D")
+    summary["A3"].alignment=Alignment(horizontal="center")
+
+    top_labels=["TOTAL SOLICITUDES","PENDIENTES","APROBADAS","RECHAZADAS"]
+    top_values=[len(rows),len(pending),len(approved),len(rejected)]
+    bottom_labels=["VENTAS APROBADAS","TICKETS CONFIRMADOS","VENCIDAS","REACTIVADAS"]
+    bottom_values=[approved_sales,confirmed_tickets,len(expired),reactivated]
+    for column,(label,value) in enumerate(zip(top_labels,top_values),1):
+        summary.cell(5,column,label); summary.cell(6,column,value)
+    for column,(label,value) in enumerate(zip(bottom_labels,bottom_values),1):
+        summary.cell(8,column,label); summary.cell(9,column,value)
+    for row_number in (5,8):
+        for cell in summary[row_number][:4]:
+            cell.font=Font(bold=True,color=white,size=11)
+            cell.fill=PatternFill("solid",fgColor="24242D")
+            cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+    for row_number in (6,9):
+        for cell in summary[row_number][:4]:
+            cell.font=Font(bold=True,color=dark,size=22)
+            cell.fill=PatternFill("solid",fgColor=light)
+            cell.alignment=Alignment(horizontal="center",vertical="center")
+            cell.border=Border(bottom=thin)
+    summary["A9"].number_format='"S/" #,##0'
+    summary.row_dimensions[5].height=26; summary.row_dimensions[6].height=46
+    summary.row_dimensions[8].height=26; summary.row_dimensions[9].height=46
+
+    summary.append([])
+    status_summary=[
+        ["ESTADO","SOLICITUDES","TICKETS","VENTAS (S/)"],
+        ["Aprobada",len(approved),confirmed_tickets,approved_sales],
+        ["Pendiente",len(pending),sum(int(row.get("quantity",0)) for row in pending),sum(int(row.get("total",0)) for row in pending)],
+        ["Rechazada",len(rejected),sum(int(row.get("quantity",0)) for row in rejected),sum(int(row.get("total",0)) for row in rejected)],
+        ["Vencida",len(expired),sum(int(row.get("quantity",0)) for row in expired),sum(int(row.get("total",0)) for row in expired)],
     ]
-    for indicator,value in indicators: summary.append([indicator,value])
-    for cell in summary[2]:
+    for row_index,row_values in enumerate(status_summary,11):
+        for column,value in enumerate(row_values,1): summary.cell(row_index,column,value)
+    for cell in summary[11][:4]:
         cell.font=Font(bold=True,color=dark); cell.fill=PatternFill("solid",fgColor=yellow)
-    summary["B10"].number_format='dd/mm/yyyy hh:mm'
-    summary.column_dimensions["A"].width=30; summary.column_dimensions["B"].width=22
-    summary.freeze_panes="A3"
+        cell.alignment=Alignment(horizontal="center")
+    for row_number in range(12,16):
+        summary.cell(row_number,1).font=Font(bold=True,color="1F2937")
+        summary.cell(row_number,4).number_format='"S/" #,##0'
+        for cell in summary[row_number][:4]: cell.border=Border(bottom=thin)
+    summary.merge_cells("A17:H17")
+    summary["A17"]="La hoja ‘Participantes y pagos’ contiene el detalle completo y permite filtrar los registros."
+    summary["A17"].font=Font(italic=True,color="594A00")
+    summary["A17"].fill=PatternFill("solid",fgColor="FFF7CC")
+    summary["A17"].alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+    for column in "ABCD": summary.column_dimensions[column].width=23
+    for column in "EFGH": summary.column_dimensions[column].width=4
+    summary.freeze_panes="A4"
 
     headers=["Código de solicitud","Nombre completo","Número de WhatsApp","Tipo de documento",
              "Número de documento","Cantidad","Total (S/)","Estado","Tickets confirmados/asignados",
@@ -377,9 +422,18 @@ def export_admin_excel():
         cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
         cell.border=Border(bottom=thin)
     for row in detail.iter_rows(min_row=2):
+        status=row[7].value
         for cell in row:
             cell.alignment=Alignment(vertical="top",wrap_text=True)
             cell.border=Border(bottom=thin)
+        if row[0].row%2==0:
+            for cell in row: cell.fill=PatternFill("solid",fgColor="F8FAFC")
+        status_colors={"Aprobada":("DCFCE7","166534"),"Pendiente":("FEF3C7","92400E"),
+                       "Rechazada":("FEE2E2","991B1B"),"Vencida":("E5E7EB","374151")}
+        if status in status_colors:
+            fill_color,font_color=status_colors[status]
+            row[7].fill=PatternFill("solid",fgColor=fill_color)
+            row[7].font=Font(bold=True,color=font_color)
         row[6].number_format='"S/" #,##0'
         row[10].number_format='dd/mm/yyyy hh:mm'
         row[11].number_format='dd/mm/yyyy hh:mm'
@@ -388,10 +442,6 @@ def export_admin_excel():
         detail.column_dimensions[chr(64+index)].width=width
     detail.freeze_panes="A2"
     detail.auto_filter.ref=f"A1:N{max(detail.max_row,1)}"
-    if detail.max_row>1:
-        table=Table(displayName="TablaParticipantes",ref=f"A1:N{detail.max_row}")
-        table.tableStyleInfo=TableStyleInfo(name="TableStyleMedium4",showRowStripes=True,showColumnStripes=False)
-        detail.add_table(table)
 
     output=BytesIO()
     workbook.save(output)
