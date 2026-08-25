@@ -296,7 +296,7 @@ def admin_orders():
     rows.sort(key=lambda row:int(row.get("created_at",0)), reverse=True)
     for row in rows:
         row["created_at"]=row.get("created_at_text","")
-        row["tickets"]=sorted(row.get("tickets",[]))
+        row["tickets"]=sorted(row.get("tickets",[]) or row.get("released_tickets",[]))
         row["proof_url"]="/admin/proof/"+row["proof_path"] if row.get("proof_path") else None
     return jsonify(orders=rows)
 
@@ -322,16 +322,81 @@ def approve(oid):
     snapshot=ref.get()
     if not snapshot.exists: return jsonify(error="No encontrado"),404
     order=snapshot.to_dict()
-    if order["status"]!="pending": return jsonify(error="La solicitud ya fue procesada"),400
+    if order["status"] not in {"pending","expired"}:
+        return jsonify(error="La solicitud ya fue procesada"),400
     now=int(time.time())
-    batch=firestore_db().batch()
-    batch.update(ref, {"status":"approved", "reviewed_at":now,
-                       "reviewed_at_text":time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(now)),
-                       "review_note":(request.json or {}).get("note") or "Pago validado"})
-    for number in order.get("tickets",[]):
-        batch.update(firestore_db().collection("tickets").document(str(number)), {"status":"confirmed"})
-    batch.commit()
-    return jsonify(ok=True)
+    reviewed_at_text=time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(now))
+    requested_note=(request.json or {}).get("note") or "Pago validado"
+
+    if order["status"]=="pending":
+        batch=firestore_db().batch()
+        batch.update(ref, {"status":"approved", "reviewed_at":now,
+                           "reviewed_at_text":reviewed_at_text,
+                           "review_note":requested_note})
+        for number in order.get("tickets",[]):
+            batch.update(firestore_db().collection("tickets").document(str(number)), {"status":"confirmed"})
+        batch.commit()
+        return jsonify(ok=True,message="Pago aprobado y tickets confirmados",tickets=order.get("tickets",[]))
+
+    # Una reserva vencida ya liberó sus números. Recuperamos los disponibles
+    # y reemplazamos únicamente los que hayan sido asignados a otra compra.
+    original=[int(number) for number in order.get("released_tickets",[]) or order.get("tickets",[])]
+    quantity=int(order.get("quantity",len(original)))
+    tickets_collection=firestore_db().collection("tickets")
+    for _ in range(12):
+        replacement_pool=[]
+        while len(replacement_pool)<max(quantity*3,20):
+            number=secrets.randbelow(900000)+100000
+            if number not in original and number not in replacement_pool:
+                replacement_pool.append(number)
+
+        transaction=firestore_db().transaction()
+        @firestore.transactional
+        def restore_expired(transaction):
+            current=ref.get(transaction=transaction)
+            if not current.exists or current.to_dict().get("status")!="expired":
+                return None
+            candidates=original+replacement_pool
+            candidate_refs=[tickets_collection.document(str(number)) for number in candidates]
+            candidate_snapshots=[ticket_ref.get(transaction=transaction) for ticket_ref in candidate_refs]
+            available={number for number,ticket_snapshot in zip(candidates,candidate_snapshots)
+                       if not ticket_snapshot.exists}
+            selected=[number for number in original if number in available]
+            selected.extend(number for number in replacement_pool
+                            if number in available and len(selected)<quantity)
+            if len(selected)<quantity:
+                return False
+            selected=selected[:quantity]
+            replaced=[number for number in original if number not in selected]
+            replacements=[number for number in selected if number not in original]
+            history_note=requested_note
+            if replacements:
+                history_note+=(". Reserva vencida reactivada; números reemplazados: "
+                               +", ".join(str(number) for number in replaced)
+                               +" por "+", ".join(str(number) for number in replacements))
+            else:
+                history_note+=". Reserva vencida reactivada con sus números originales"
+            transaction.update(ref,{"status":"approved", "tickets":selected,
+                                    "reviewed_at":now, "reviewed_at_text":reviewed_at_text,
+                                    "review_note":history_note,
+                                    "reactivated_from_expired":True,
+                                    "original_tickets":original})
+            for number in selected:
+                transaction.set(tickets_collection.document(str(number)),{
+                    "number":number, "order_id":oid, "order_code":order.get("code"),
+                    "status":"confirmed", "created_at":now,
+                })
+            return {"tickets":selected,"replaced":replaced,"replacements":replacements}
+
+        result=restore_expired(transaction)
+        if result is None:
+            return jsonify(error="La solicitud ya fue procesada"),400
+        if result:
+            message="Pago vencido aprobado con los números originales"
+            if result["replacements"]:
+                message="Pago vencido aprobado; se asignaron números de reemplazo"
+            return jsonify(ok=True,message=message,**result)
+    return jsonify(error="No se pudieron reservar números disponibles. Intenta nuevamente"),409
 
 @app.post("/api/admin/orders/<oid>/reject")
 @admin_required
