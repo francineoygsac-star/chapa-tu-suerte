@@ -223,6 +223,9 @@ async function lookupDni(){
   }
   if(dni===lastDniLookup) return;
 
+  // Se marca antes de iniciar la llamada para impedir consultas duplicadas
+  // mientras JSON.pe todavía está respondiendo.
+  lastDniLookup=dni;
   setDniMsg('Consultando datos del DNI…');
   try{
     const r=await fetch('/api/identity/dni',{
@@ -234,10 +237,8 @@ async function lookupDni(){
     if(!r.ok) throw new Error(data.error||'No se pudo consultar el DNI.');
     const person=data.data||{};
     name.value=person.nombre_completo||[person.nombres,person.apellido_paterno,person.apellido_materno].filter(Boolean).join(' ');
-    lastDniLookup=dni;
     setDniMsg('✓ Datos encontrados y completados automáticamente.',true);
   }catch(e){
-    lastDniLookup='';
     setDniMsg(e.message||'No se pudo consultar el DNI.');
   }
 }
