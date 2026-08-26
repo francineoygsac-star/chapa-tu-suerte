@@ -105,7 +105,7 @@ footer{background:#030305;color:#777;text-align:center;padding:35px;font-size:12
         <p style="color:#bbb;margin-top:0">Realiza el pago por el monto exacto a cualquiera de estos números y luego adjunta tu comprobante.</p>
         <div style="margin:14px 0;padding:14px 16px;border:1px solid #25d366;border-radius:12px;background:#07130b;color:#dfffea">
           <strong>📲 CONFIRMACIÓN POR WHATSAPP</strong><br>
-          <span style="color:#b9d9c5">Después de registrar tu compra, pulsa el botón de WhatsApp para enviar tu solicitud al <b>905 674 389</b>. El comprobante ya quedará guardado en nuestro sistema y no tendrás que adjuntarlo nuevamente.</span>
+          <span style="color:#b9d9c5">Después de registrar tu compra, se te enviará por WhatsApp la confirmación de <b>"TICKET APROBADO"</b>. El comprobante ya quedará guardado en nuestro sistema y no tendrás que adjuntarlo nuevamente.</span>
         </div>
 
         <div class="yape-item">
@@ -187,6 +187,22 @@ function setDniMsg(text, ok=false){
 function resetDniLookup(){
   lastDniLookup='';
   setDniMsg('');
+}
+
+function resetPurchaseForm(){
+  document.getElementById('buyerName').value='';
+  document.getElementById('buyerPhone').value='';
+  document.getElementById('documentType').value='DNI';
+  const documentInput=document.getElementById('documentNumber');
+  documentInput.value='';
+  documentInput.maxLength=8;
+  documentInput.placeholder='Ej. 12345678';
+  document.getElementById('proof').value='';
+  qty=1;
+  document.getElementById('qty').textContent='1';
+  document.getElementById('total').textContent='10';
+  clearTimeout(dniLookupTimer);
+  resetDniLookup();
 }
 
 async function lookupDni(){
@@ -292,6 +308,9 @@ async function submitOrder(){
     waBtn.href=waUrl;
     waBtn.style.display='block';
 
+    // Conserva el resultado y el enlace de WhatsApp, pero deja todos los
+    // campos preparados para registrar inmediatamente una nueva compra.
+    resetPurchaseForm();
     document.getElementById('ticketResult').style.display='block';
     document.getElementById('ticketResult').scrollIntoView({behavior:'smooth',block:'center'});
     setMsg('Solicitud registrada. Pulsa el botón verde para solicitar la confirmación por WhatsApp.',true);
