@@ -120,8 +120,9 @@ footer{background:#030305;color:#777;text-align:center;padding:35px;font-size:12
         </div>
 
         <div class="field">
-          <label for="proof">Comprobante de Yape (imagen)</label>
-          <input id="proof" type="file" accept="image/jpeg,image/png,image/webp" style="width:100%;padding:12px;border-radius:10px;background:#17171e;color:#fff">
+          <label for="proof">Comprobante(s) de Yape</label>
+          <input id="proof" type="file" multiple accept="image/jpeg,image/png,image/webp" style="width:100%;padding:12px;border-radius:10px;background:#17171e;color:#fff">
+          <div class="note" style="margin-top:7px">Puedes adjuntar hasta 5 capturas si dividiste el pago entre Omar y Franci. Cada imagen puede pesar hasta 5 MB.</div>
         </div>
         <button class="confirm-btn" type="button" onclick="submitOrder()">ENVIAR COMPROBANTE Y RESERVAR TICKETS</button>
         <p id="purchaseMsg" class="note"></p>
@@ -271,17 +272,18 @@ async function submitOrder(){
   const phone=document.getElementById('buyerPhone').value.trim();
   const documentType=document.getElementById('documentType').value;
   const documentNumber=document.getElementById('documentNumber').value.trim();
-  const proof=document.getElementById('proof').files[0];
+  const proofs=[...document.getElementById('proof').files];
   if(!name){ setMsg('Completa tu nombre.'); return; }
   if(!/^9\d{8}$/.test(phone)){ setMsg('Ingresa un número de WhatsApp peruano válido de 9 dígitos.'); return; }
   if((documentType==='DNI'&&!/^\d{8}$/.test(documentNumber))||(documentType==='CE'&&!/^\d{6,12}$/.test(documentNumber))){setMsg('Ingresa un documento válido.');return;}
-  if(!proof){ setMsg('Adjunta el comprobante de Yape.'); return; }
-  if(proof.size > 5*1024*1024){ setMsg('El comprobante no puede superar 5 MB.'); return; }
+  if(!proofs.length){ setMsg('Adjunta al menos un comprobante de Yape.'); return; }
+  if(proofs.length>5){setMsg('Puedes adjuntar como máximo 5 comprobantes.');return;}
+  if(proofs.some(file=>file.size>5*1024*1024)){ setMsg('Cada comprobante puede pesar como máximo 5 MB.'); return; }
 
   const fd=new FormData();
   fd.append('name',name); fd.append('phone',phone);
   fd.append('document_type',documentType); fd.append('document_number',documentNumber);
-  fd.append('quantity',qty); fd.append('proof',proof);
+  fd.append('quantity',qty); proofs.forEach(proof=>fd.append('proof',proof));
   setMsg('Generando solicitud…');
 
   try{
