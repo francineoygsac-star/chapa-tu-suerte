@@ -120,6 +120,11 @@ def identity_dni():
         cache_snapshot=cache_ref.get()
         if cache_snapshot.exists:
             saved=cache_snapshot.to_dict() or {}
+            cache_age=now-int(saved.get("updated_at",0))
+            if saved.get("status")=="not_found" and cache_age < 24*60*60:
+                return jsonify(error="No se encontraron datos para este DNI. Escribe el nombre completo manualmente.",cached=True),404
+            if saved.get("status")=="temporary_error" and cache_age < 5*60:
+                return jsonify(error="El servicio de consulta no respondió correctamente. Escribe el nombre completo manualmente o intenta más tarde.",cached=True),503
             if (int(saved.get("updated_at",0)) >= now-DNI_CACHE_SECONDS
                     and str(saved.get("nombre_completo") or "").strip()):
                 clean={key:saved.get(key) for key in (
@@ -154,12 +159,22 @@ def identity_dni():
             message=detail.get("message") or detail.get("error") or "No se pudo consultar el DNI"
         except Exception:
             message="No se pudo consultar el DNI"
+        if e.code in {404,422}:
+            try: cache_ref.set({"numero":dni,"status":"not_found","updated_at":now})
+            except Exception: pass
+            message="No se encontraron datos para este DNI. Escribe el nombre completo manualmente."
         return jsonify(error=message), e.code if 400 <= e.code < 500 else 502
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return jsonify(error="No se pudo conectar con el servicio de consulta de DNI"),502
+        # Evita que un doble clic o una respuesta defectuosa consuma de nuevo
+        # durante los siguientes cinco minutos.
+        try: cache_ref.set({"numero":dni,"status":"temporary_error","updated_at":now})
+        except Exception: pass
+        return jsonify(error="El servicio de consulta no respondió correctamente. Escribe el nombre completo manualmente o intenta más tarde."),502
 
     if not result.get("success"):
-        return jsonify(error=result.get("message") or "No se encontró información para ese DNI"),404
+        try: cache_ref.set({"numero":dni,"status":"not_found","updated_at":now})
+        except Exception: pass
+        return jsonify(error="No se encontraron datos para este DNI. Escribe el nombre completo manualmente."),404
 
     data=result.get("data") or {}
     nombres=str(data.get("nombres") or "").strip()
@@ -179,7 +194,7 @@ def identity_dni():
     }
     DNI_CACHE[dni]=clean
     try:
-        cache_ref.set({**clean,"updated_at":now})
+        cache_ref.set({**clean,"status":"verified","updated_at":now})
     except Exception:
         # No se invalida una consulta oficial exitosa por un fallo al guardar el caché.
         pass
