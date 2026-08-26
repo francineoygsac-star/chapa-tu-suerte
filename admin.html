@@ -2,7 +2,7 @@
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Administración · Chapa Tu Suerte</title>
 <style>
-body{font-family:Arial;margin:0;background:#07070b;color:#fff}.wrap{max-width:1200px;margin:auto;padding:24px}.card{background:#12121a;border:1px solid #2a2a33;border-radius:16px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}.stat{padding:16px;border-radius:14px;background:#1a1a23}.stat b{display:block;font-size:28px;color:#ffd400}button{border:0;border-radius:9px;padding:10px 14px;font-weight:900;cursor:pointer}.approve{background:#16a66a;color:#fff}.reject{background:#d9273f;color:#fff}.login{max-width:420px;margin:10vh auto}.field{margin:12px 0}.field label{display:block;margin-bottom:6px;font-weight:800}.field input{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#0c0c11;color:#fff;box-sizing:border-box}.toolbar{display:flex;gap:8px;flex-wrap:wrap}.order{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:start}.badge{display:inline-block;padding:5px 8px;border-radius:999px;background:#292934;font-size:12px}.tickets{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.ticket{background:#0a7c4b;padding:6px 9px;border-radius:999px;font-weight:900}.proof{width:180px;height:180px;object-fit:cover;border-radius:10px;display:block;margin-top:8px;background:#20202a}.loading{padding:28px;text-align:center;color:#c9c9d2}.proof-wrap{display:inline-block;min-height:180px}@media(max-width:800px){.grid{grid-template-columns:repeat(2,1fr)}.order{grid-template-columns:1fr}.proof{width:150px;height:150px}}
+body{font-family:Arial;margin:0;background:#07070b;color:#fff}.wrap{max-width:1200px;margin:auto;padding:24px}.card{background:#12121a;border:1px solid #2a2a33;border-radius:16px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}.stat{padding:16px;border-radius:14px;background:#1a1a23}.stat b{display:block;font-size:28px;color:#ffd400}button{border:0;border-radius:9px;padding:10px 14px;font-weight:900;cursor:pointer}.approve{background:#16a66a;color:#fff}.reject{background:#d9273f;color:#fff}.whatsapp{background:#25d366;color:#07140c;display:block;margin-top:10px;width:100%}.login{max-width:420px;margin:10vh auto}.field{margin:12px 0}.field label{display:block;margin-bottom:6px;font-weight:800}.field input{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#0c0c11;color:#fff;box-sizing:border-box}.toolbar{display:flex;gap:8px;flex-wrap:wrap}.order{display:grid;grid-template-columns:1fr auto;gap:14px;align-items:start}.badge{display:inline-block;padding:5px 8px;border-radius:999px;background:#292934;font-size:12px}.tickets{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.ticket{background:#0a7c4b;padding:6px 9px;border-radius:999px;font-weight:900}.proof{width:180px;height:180px;object-fit:contain;border-radius:10px;display:block;margin-top:8px;background:#20202a}.loading{padding:28px;text-align:center;color:#c9c9d2}.proof-wrap{display:inline-block;min-height:180px}@media(max-width:800px){.grid{grid-template-columns:repeat(2,1fr)}.order{grid-template-columns:1fr}.proof{width:150px;height:150px}}
 </style></head><body><div class="wrap">
 <div id="login" class="card login"><h1>Panel de administración</h1><p>Chapa Tu Suerte</p>
 <div class="field"><label>Usuario</label><input id="u" value="admin"></div>
@@ -18,6 +18,35 @@ async function logout(){await fetch('/admin/logout',{method:'POST'});location.re
 function downloadExcel(){window.location.href='/api/admin/export.xlsx'}
 async function stats(){let r=await fetch('/api/admin/stats');if(!r.ok)return;let d=await r.json();document.getElementById('stats').innerHTML=[['Pendientes',d.pending],['Aprobadas',d.approved],['Rechazadas',d.rejected],['Tickets confirmados',d.confirmed_tickets],['Ventas aprobadas','S/'+d.sales_approved]].map(x=>'<div class="stat">'+x[0]+'<b>'+x[1]+'</b></div>').join('')}
 let proofObserver;
+let currentOrders=[];
+const statusLabels={pending:'PENDIENTE',approved:'APROBADA',rejected:'RECHAZADA',expired:'VENCIDA'};
+function sendWhatsApp(id){
+  const o=currentOrders.find(item=>String(item.id)===String(id));
+  if(!o){alert('No se encontró la solicitud');return}
+  const phone=String(o.phone||'').replace(/\D/g,'');
+  if(!/^9\d{8}$/.test(phone)){alert('La solicitud no tiene un número de WhatsApp válido');return}
+  const state=statusLabels[o.status]||String(o.status||'').toUpperCase();
+  const ticketNumbers=(o.tickets||[]).join(', ')||'Ninguno';
+  const ticketLabel=o.status==='approved'?'Tickets asignados':
+    o.status==='pending'?'Tickets reservados':'Tickets liberados';
+  const closing={
+    pending:'Hemos recibido tu solicitud y el pago se encuentra pendiente de validación.',
+    approved:'Tu pago fue validado correctamente. Conserva este mensaje como confirmación de tu participación.',
+    rejected:'El pago no pudo ser validado. Comunícate con nosotros si necesitas una nueva revisión.',
+    expired:'El tiempo de reserva terminó y los números fueron liberados. Comunícate con nosotros si ya realizaste el pago.'
+  }[o.status]||'Consulta con nosotros si necesitas más información.';
+  const lines=[
+    'CHAPA TU SUERTE - SOLICITUD DE COMPRA ('+state+')','',
+    'Nombre: '+o.name,
+    'Número de WhatsApp: '+phone,
+    'Cantidad de tickets: '+o.quantity,
+    'Total: S/'+o.total,
+    'Código de solicitud: '+o.code,
+    ticketLabel+': '+ticketNumbers,'',closing
+  ];
+  if((o.status==='rejected'||o.status==='expired')&&o.review_note)lines.push('Observación: '+o.review_note);
+  window.open('https://wa.me/51'+phone+'?text='+encodeURIComponent(lines.join('\n')),'_blank','noopener');
+}
 function activateProofs(){
   if(proofObserver)proofObserver.disconnect();
   proofObserver=new IntersectionObserver(entries=>entries.forEach(entry=>{
@@ -35,7 +64,8 @@ async function load(status){
   let r=await fetch('/api/admin/orders?status='+encodeURIComponent(status));
   if(r.status===401){document.getElementById('login').style.display='block';document.getElementById('app').style.display='none';return}
   let d=await r.json();
-  container.innerHTML=d.orders.map(o=>'<div class="card order"><div><h2>'+esc(o.code)+' <span class="badge">'+esc(o.status.toUpperCase())+'</span></h2><p><b>'+esc(o.name)+'</b> · '+esc(o.phone)+' · '+o.quantity+' ticket(s) · S/'+o.total+'</p><p>Creado: '+esc(o.created_at)+'</p><div class="tickets">'+o.tickets.map(t=>'<span class="ticket">#'+t+'</span>').join('')+'</div>'+(o.proof_url?'<a class="proof-wrap" href="'+encodeURI(o.proof_url)+'" target="_blank" title="Abrir comprobante completo"><img class="proof" data-src="'+encodeURI(o.proof_url)+'" alt="Comprobante de '+esc(o.code)+'" loading="lazy" decoding="async"></a>':'')+'</div><div>'+ (o.status==='pending'?'<button class="approve" onclick="act('+o.id+',\'approve\')">APROBAR PAGO</button> <button class="reject" onclick="act('+o.id+',\'reject\')">RECHAZAR</button>':o.status==='expired'?'<button class="approve" onclick="act('+o.id+',\'approve\')">VALIDAR PAGO VENCIDO</button>':'<span class="badge">'+esc(o.review_note||'Procesado')+'</span>')+'</div></div>').join('');
+  currentOrders=d.orders;
+  container.innerHTML=d.orders.map(o=>'<div class="card order"><div><h2>'+esc(o.code)+' <span class="badge">'+esc(statusLabels[o.status]||o.status.toUpperCase())+'</span></h2><p><b>'+esc(o.name)+'</b> · '+esc(o.phone)+' · '+o.quantity+' ticket(s) · S/'+o.total+'</p><p>Creado: '+esc(o.created_at)+' <span class="badge">HORA PERÚ</span></p><div class="tickets">'+o.tickets.map(t=>'<span class="ticket">#'+t+'</span>').join('')+'</div>'+(o.proof_url?'<a class="proof-wrap" href="'+encodeURI(o.proof_url)+'" target="_blank" title="Abrir comprobante completo"><img class="proof" data-src="'+encodeURI(o.proof_url)+'" alt="Comprobante de '+esc(o.code)+'" loading="lazy" decoding="async"></a>':'')+'</div><div>'+ (o.status==='pending'?'<button class="approve" onclick="act('+o.id+',\'approve\')">APROBAR PAGO</button> <button class="reject" onclick="act('+o.id+',\'reject\')">RECHAZAR</button>':o.status==='expired'?'<button class="approve" onclick="act('+o.id+',\'approve\')">VALIDAR PAGO VENCIDO</button>':'<span class="badge">'+esc(o.review_note||'Procesado')+'</span>')+'<button class="whatsapp" data-id="'+o.id+'" onclick="sendWhatsApp(this.dataset.id)">ENVIAR ESTADO POR WHATSAPP</button></div></div>').join('');
   if(!d.orders.length)container.innerHTML='<div class="loading">No hay solicitudes en esta categoría.</div>';
   activateProofs();
 }

@@ -42,6 +42,14 @@ def safe_filename_part(value):
     value=re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
     return value[:60] or "SIN_NOMBRE"
 
+def lima_datetime_text(timestamp):
+    """Convierte un timestamp UTC a la fecha y hora administrativa de Perú."""
+    if not timestamp:
+        return ""
+    return datetime.fromtimestamp(int(timestamp),timezone.utc).astimezone(
+        ZoneInfo("America/Lima")
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
 def cleanup_expired():
     """Libera reservas pendientes con más de 30 minutos."""
     global _LAST_EXPIRED_CLEANUP
@@ -340,7 +348,7 @@ def admin_orders():
     rows=[snapshot.to_dict() for snapshot in query.limit(200).stream()]
     rows.sort(key=lambda row:int(row.get("created_at",0)), reverse=True)
     for row in rows:
-        row["created_at"]=row.get("created_at_text","")
+        row["created_at"]=lima_datetime_text(row.get("created_at")) or row.get("created_at_text","")
         row["tickets"]=sorted(row.get("tickets",[]) or row.get("released_tickets",[]))
         row["proof_url"]="/admin/proof/"+row["proof_path"] if row.get("proof_path") else None
     return jsonify(orders=rows)
