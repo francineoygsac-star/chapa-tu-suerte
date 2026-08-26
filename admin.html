@@ -7,14 +7,18 @@ body{font-family:Arial;margin:0;background:#07070b;color:#fff}.wrap{max-width:12
 <div id="login" class="card login"><h1>Panel de administración</h1><p>Chapa Tu Suerte</p>
 <div class="field"><label>Usuario</label><input id="u" value="admin"></div>
 <div class="field"><label>Contraseña</label><input id="p" type="password"></div>
+<div class="field"><label>Código de seguridad (si está activado)</label><input id="otp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6 dígitos"></div>
 <button onclick="login()" style="background:#ffd400">INGRESAR</button><div id="lm" style="margin-top:12px"></div></div>
-<div id="app" style="display:none"><div style="display:flex;justify-content:space-between;align-items:center"><h1>Solicitudes y tickets</h1><button onclick="logout()">SALIR</button></div>
+<div id="app" style="display:none"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h1>Solicitudes y tickets</h1><div><button onclick="revokeAllSessions()" style="background:#8f1425;color:#fff">CERRAR TODAS LAS SESIONES</button> <button onclick="logout()">SALIR</button></div></div>
 <div class="grid" id="stats"></div>
 <div class="toolbar" style="margin:18px 0"><button onclick="load('all')">TODAS</button><button onclick="load('pending')">PENDIENTES</button><button onclick="load('approved')">APROBADAS</button><button onclick="load('rejected')">RECHAZADAS</button><button onclick="load('expired')">VENCIDAS</button><button onclick="downloadExcel()" style="background:#168b4b;color:#fff">📊 DESCARGAR EXCEL</button><button onclick="deleteSelected()" style="background:#8f1425;color:#fff">🗑 ELIMINAR SELECCIONADAS</button></div>
 <div id="orders"></div></div></div>
 <script>
-async function login(){let r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u.value,password:p.value})});let d=await r.json();if(!r.ok){lm.textContent=d.error;return}document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';load('pending');stats();}
-async function logout(){await fetch('/admin/logout',{method:'POST'});location.reload()}
+let csrfToken='';
+function adminHeaders(){return {'Content-Type':'application/json','X-CSRF-Token':csrfToken}}
+async function login(){let r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u.value,password:p.value,totp:otp.value})});let d=await r.json();if(!r.ok){lm.textContent=d.error;return}csrfToken=d.csrf_token||'';p.value='';otp.value='';document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';load('pending');stats();}
+async function logout(){await fetch('/admin/logout',{method:'POST',headers:adminHeaders()});csrfToken='';location.reload()}
+async function revokeAllSessions(){if(!confirm('Se cerrará el panel en todos los dispositivos. ¿Deseas continuar?'))return;const r=await fetch('/api/admin/sessions/revoke-all',{method:'POST',headers:adminHeaders()});const d=await r.json();if(!r.ok){alert(d.error||'No se pudieron cerrar las sesiones.');return}csrfToken='';alert('Todas las sesiones fueron cerradas.');location.reload()}
 function downloadExcel(){window.location.href='/api/admin/export.xlsx'}
 async function stats(){let r=await fetch('/api/admin/stats');if(!r.ok)return;let d=await r.json();document.getElementById('stats').innerHTML=[['Pendientes',d.pending],['Aprobadas',d.approved],['Rechazadas',d.rejected],['Tickets confirmados',d.confirmed_tickets],['Ventas aprobadas','S/'+d.sales_approved]].map(x=>'<div class="stat">'+x[0]+'<b>'+x[1]+'</b></div>').join('')}
 let proofObserver;
@@ -54,7 +58,7 @@ async function deleteSelected(){
   const answer=prompt('Esta acción eliminará permanentemente '+ids.length+' compra(s), sus tickets y comprobantes.\n\nEscribe ELIMINAR para confirmar:');
   if(answer!=='ELIMINAR')return;
   const r=await fetch('/api/admin/orders/delete-selected',{
-    method:'POST',headers:{'Content-Type':'application/json'},
+    method:'POST',headers:adminHeaders(),
     body:JSON.stringify({ids,confirmation:'ELIMINAR'})
   });
   const d=await r.json();
@@ -87,6 +91,6 @@ async function load(status){
   if(!d.orders.length)container.innerHTML='<div class="loading">No hay solicitudes en esta categoría.</div>';
   activateProofs();
 }
-async function act(id,a){let note=prompt(a==='approve'?'Nota de aprobación (opcional):':'Motivo del rechazo (opcional):')||'';let r=await fetch('/api/admin/orders/'+id+'/'+a,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({note})});let d=await r.json();if(!r.ok){alert(d.error);return}if(d.message)alert(d.message+(d.replacements&&d.replacements.length?'\nTickets confirmados: '+d.tickets.join(', '):''));load('pending');stats()}
+async function act(id,a){let note=prompt(a==='approve'?'Nota de aprobación (opcional):':'Motivo del rechazo (opcional):')||'';let r=await fetch('/api/admin/orders/'+id+'/'+a,{method:'POST',headers:adminHeaders(),body:JSON.stringify({note})});let d=await r.json();if(!r.ok){alert(d.error);return}if(d.message)alert(d.message+(d.replacements&&d.replacements.length?'\nTickets confirmados: '+d.tickets.join(', '):''));load('pending');stats()}
 function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
 </script></body></html>

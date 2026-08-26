@@ -1,21 +1,27 @@
 
-import os, secrets, hmac, time, mimetypes, json, urllib.request, urllib.error, re, unicodedata
+import os, secrets, hmac, time, mimetypes, json, urllib.request, urllib.error, re, unicodedata, hashlib
+from collections import defaultdict, deque
 from io import BytesIO
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory, make_response, redirect, session, send_file
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from google.cloud import storage
 from google.cloud import firestore
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 BASE = Path(__file__).resolve().parent
 PUBLIC = BASE / "public"
 
 app = Flask(__name__, static_folder=str(PUBLIC), static_url_path="")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.secret_key = os.environ.get("FLASK_SECRET", "CHANGE_THIS_SECRET_IN_PRODUCTION")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "CAMBIA_ESTA_CLAVE")
+ADMIN_TOTP_SECRET = os.environ.get("ADMIN_TOTP_SECRET", "").replace(" ", "").strip().upper()
 MAX_TICKETS = 999999
 PRICE = 10
 JSONPE_TOKEN = os.environ.get("JSONPE_TOKEN", "").strip()
@@ -25,6 +31,47 @@ DNI_CACHE_SECONDS = 90*24*60*60
 _FIRESTORE_DB = None
 _ADMIN_SESSION_CACHE = {}
 _LAST_EXPIRED_CLEANUP = 0
+limiter = Limiter(key_func=get_remote_address, app=app, default_limits=[], storage_uri="memory://")
+
+@app.errorhandler(429)
+def rate_limited(_error):
+    return jsonify(error="Demasiados intentos. Espera unos minutos antes de volver a intentar."),429
+
+def token_digest(value):
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+def audit(action, details=None, actor=None):
+    """Registra acciones sensibles sin guardar contraseñas, tokens ni comprobantes."""
+    try:
+        firestore_db().collection("admin_audit").add({
+            "action":str(action)[:80], "actor":str(actor or ADMIN_USER)[:80],
+            "ip":get_remote_address(), "created_at":int(time.time()),
+            "details":details or {},
+        })
+    except Exception:
+        app.logger.exception("No se pudo guardar el evento de auditoría")
+
+def same_origin_request():
+    origin=(request.headers.get("Origin") or "").rstrip("/")
+    referer=(request.headers.get("Referer") or "").rstrip("/")
+    expected=request.host_url.rstrip("/")
+    return (not origin or hmac.compare_digest(origin,expected)) and (not referer or referer.startswith(expected+"/"))
+
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options","nosniff")
+    response.headers.setdefault("X-Frame-Options","DENY")
+    response.headers.setdefault("Referrer-Policy","no-referrer")
+    response.headers.setdefault("Permissions-Policy","camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; "
+        "base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
+    if request.is_secure:
+        response.headers.setdefault("Strict-Transport-Security","max-age=31536000; includeSubDomains")
+    if request.path.startswith("/admin") or request.path.startswith("/api/admin"):
+        response.headers["Cache-Control"]="no-store, private"
+    return response
 
 def firestore_db():
     global _FIRESTORE_DB
@@ -83,15 +130,21 @@ def admin_required(fn):
         token=request.cookies.get("admin_session")
         if not token: return jsonify(error="No autorizado"),401
         now=int(time.time())
-        cached_until=_ADMIN_SESSION_CACHE.get(token,0)
-        if cached_until <= now:
-            snapshot=firestore_db().collection("admin_sessions").document(token).get()
+        digest=token_digest(token)
+        cached=_ADMIN_SESSION_CACHE.get(digest) or {}
+        if int(cached.get("cached_until",0)) <= now:
+            snapshot=firestore_db().collection("admin_sessions").document(digest).get()
             if not snapshot.exists or int((snapshot.to_dict() or {}).get("created_at",0)) <= now-86400:
-                _ADMIN_SESSION_CACHE.pop(token,None)
+                _ADMIN_SESSION_CACHE.pop(digest,None)
                 return jsonify(error="No autorizado"),401
-            # La cookie sigue siendo la autoridad; este caché solo ahorra lecturas
-            # repetidas durante cinco minutos dentro de la misma instancia.
-            _ADMIN_SESSION_CACHE[token]=now+300
+            saved=snapshot.to_dict() or {}
+            cached={"cached_until":now+300,"csrf_hash":saved.get("csrf_hash","")}
+            _ADMIN_SESSION_CACHE[digest]=cached
+        if request.method not in {"GET","HEAD","OPTIONS"}:
+            csrf=request.headers.get("X-CSRF-Token","")
+            if (not same_origin_request() or not csrf or
+                    not hmac.compare_digest(token_digest(csrf),str(cached.get("csrf_hash","")))):
+                return jsonify(error="Solicitud de seguridad inválida. Vuelve a iniciar sesión."),403
         return fn(*args, **kwargs)
     return wrapper
 
@@ -100,6 +153,7 @@ def home():
     return send_from_directory(PUBLIC,"index.html")
 
 @app.post("/api/identity/dni")
+@limiter.limit("12 per minute; 40 per hour")
 def identity_dni():
     """Consulta DNI en JSON.pe sin exponer el token al navegador."""
     dni=(request.json or {}).get("dni", "") if request.is_json else (request.form.get("dni") or "")
@@ -202,6 +256,7 @@ def identity_dni():
 
 
 @app.post("/api/orders")
+@limiter.limit("5 per 10 minutes; 20 per day")
 def create_order():
     cleanup_expired()
     name=(request.form.get("name") or "").strip()
@@ -223,6 +278,28 @@ def create_order():
     if proof.mimetype not in {"image/jpeg","image/png","image/webp"}: return jsonify(error="Formato no permitido"),400
     raw=proof.read()
     if len(raw)>5*1024*1024: return jsonify(error="Comprobante demasiado grande"),400
+    try:
+        from PIL import Image, UnidentifiedImageError
+        Image.MAX_IMAGE_PIXELS=25_000_000
+        source=Image.open(BytesIO(raw))
+        source.verify()
+        source=Image.open(BytesIO(raw))
+        if getattr(source,"is_animated",False):
+            return jsonify(error="No se permiten imágenes animadas"),400
+        source.load()
+        output=BytesIO()
+        if proof.mimetype=="image/png":
+            source.convert("RGBA" if "A" in source.getbands() else "RGB").save(output,"PNG",optimize=True)
+            ext=".png"; verified_type="image/png"
+        elif proof.mimetype=="image/webp":
+            source.convert("RGB").save(output,"WEBP",quality=88,method=4)
+            ext=".webp"; verified_type="image/webp"
+        else:
+            source.convert("RGB").save(output,"JPEG",quality=90,optimize=True)
+            ext=".jpg"; verified_type="image/jpeg"
+        raw=output.getvalue()
+    except Exception:
+        return jsonify(error="El archivo no es una imagen válida"),400
 
     code=make_code()
     oid=str(int(time.time()*1000)*100+secrets.randbelow(100))
@@ -266,12 +343,10 @@ def create_order():
         if not nums:
             raise RuntimeError("No se pudieron reservar números únicos")
 
-        ext={ "image/jpeg":".jpg","image/png":".png","image/webp":".webp"}[proof.mimetype]
-        timestamp=time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-        filename=(f"{document_type}_{document_number}_{safe_filename_part(name)}_"
-                  f"{timestamp}_{code}{ext}")
+        # El nombre del objeto no contiene DNI, teléfono ni nombre del comprador.
+        filename=f"proof_{secrets.token_hex(24)}{ext}"
         blob=storage_bucket().blob(filename)
-        blob.upload_from_string(raw, content_type=proof.mimetype)
+        blob.upload_from_string(raw, content_type=verified_type)
         orders.document(oid).update({"proof_path":filename})
     except Exception:
         # Si falla la imagen, libera la reserva para no dejar tickets bloqueados.
@@ -285,6 +360,7 @@ def create_order():
     return jsonify(order_code=code,quantity=quantity,total=quantity*PRICE,tickets=nums,status="pending"),201
 
 @app.get("/api/tickets/<number>")
+@limiter.limit("30 per minute")
 def ticket(number):
     if not number.isdigit() or len(number)!=6: return jsonify(error="Número inválido"),400
     ticket_snapshot=firestore_db().collection("tickets").document(number).get()
@@ -300,23 +376,30 @@ def ticket(number):
       ("confirmed","approved"):("CONFIRMADO"),
     }
     label=status_map.get((ticket_data["status"],order["status"]),"EN REVISIÓN")
-    return jsonify(number=ticket_data["number"],name=order["name"],status_label=label)
+    words=str(order.get("name") or "").split()
+    masked_name=" ".join((word[:1]+"***") for word in words[:3])
+    return jsonify(number=ticket_data["number"],name=masked_name,status_label=label)
 
 
 @app.get("/api/tickets/by-document")
+@limiter.limit("10 per minute; 50 per day")
 def tickets_by_document():
     document_type=(request.args.get("document_type") or "").strip().upper()
     document_number=(request.args.get("document_number") or "").strip()
+    phone=re.sub(r"\D","",request.args.get("phone") or "")
     if document_type not in {"DNI","CE"} or not document_number.isdigit():
         return jsonify(error="Documento inválido"),400
     if document_type=="DNI" and len(document_number)!=8:
         return jsonify(error="El DNI debe tener 8 dígitos"),400
     if document_type=="CE" and not 6<=len(document_number)<=12:
         return jsonify(error="El Carnet de Extranjería debe tener entre 6 y 12 dígitos"),400
+    if not re.fullmatch(r"9\d{8}",phone):
+        return jsonify(error="Ingresa el WhatsApp usado en la compra"),400
     cleanup_expired()
     snapshots=firestore_db().collection("orders").where("document_number", "==", document_number).limit(200).stream()
     orders=[snapshot.to_dict() for snapshot in snapshots]
-    orders=[o for o in orders if o.get("document_type")==document_type]
+    orders=[o for o in orders if o.get("document_type")==document_type and
+            hmac.compare_digest(str(o.get("phone") or ""),phone)]
     if not orders: return jsonify(error="No se encontraron tickets para ese documento"),404
     labels={"pending":"PENDIENTE DE VALIDACIÓN","approved":"CONFIRMADO","rejected":"RECHAZADO","expired":"RESERVA VENCIDA"}
     orders.sort(key=lambda o:int(o.get("created_at",0)), reverse=True)
@@ -335,23 +418,58 @@ def tickets_by_document():
                    total_tickets=sum(len(x["tickets"]) for x in result),orders=result)
 
 @app.post("/admin/login")
+@limiter.limit("5 per minute; 20 per hour")
 def login():
     data=request.form or request.json or {}
-    if data.get("username")!=ADMIN_USER or not hmac.compare_digest(str(data.get("password","")),ADMIN_PASSWORD):
+    if ADMIN_PASSWORD=="CAMBIA_ESTA_CLAVE" or app.secret_key=="CHANGE_THIS_SECRET_IN_PRODUCTION":
+        return jsonify(error="La seguridad del administrador no está configurada"),503
+    valid_user=hmac.compare_digest(str(data.get("username","")),ADMIN_USER)
+    valid_password=hmac.compare_digest(str(data.get("password","")),ADMIN_PASSWORD)
+    valid_totp=True
+    if ADMIN_TOTP_SECRET:
+        try:
+            import pyotp
+            valid_totp=pyotp.TOTP(ADMIN_TOTP_SECRET).verify(str(data.get("totp","")),valid_window=1)
+        except Exception:
+            valid_totp=False
+    if not (valid_user and valid_password and valid_totp):
+        audit("login_failed",{"username":str(data.get("username", ""))[:80]},actor="unknown")
         return jsonify(error="Credenciales incorrectas"),401
     token=secrets.token_urlsafe(32)
-    firestore_db().collection("admin_sessions").document(token).set({"created_at":int(time.time())})
-    _ADMIN_SESSION_CACHE[token]=int(time.time())+300
-    r=jsonify(ok=True); r.set_cookie("admin_session",token,httponly=True,samesite="Lax",secure=bool(os.environ.get("COOKIE_SECURE")),max_age=86400)
+    csrf=secrets.token_urlsafe(32)
+    digest=token_digest(token)
+    saved={"created_at":int(time.time()),"csrf_hash":token_digest(csrf),"actor":ADMIN_USER}
+    firestore_db().collection("admin_sessions").document(digest).set(saved)
+    _ADMIN_SESSION_CACHE[digest]={"cached_until":int(time.time())+300,"csrf_hash":saved["csrf_hash"]}
+    audit("login_success")
+    r=jsonify(ok=True,csrf_token=csrf,totp_enabled=bool(ADMIN_TOTP_SECRET))
+    r.set_cookie("admin_session",token,httponly=True,samesite="Strict",secure=True,max_age=86400,path="/")
     return r
 
 @app.post("/admin/logout")
+@admin_required
 def logout():
     token=request.cookies.get("admin_session")
     if token:
-        _ADMIN_SESSION_CACHE.pop(token,None)
-        firestore_db().collection("admin_sessions").document(token).delete()
-    r=jsonify(ok=True); r.delete_cookie("admin_session"); return r
+        digest=token_digest(token)
+        _ADMIN_SESSION_CACHE.pop(digest,None)
+        firestore_db().collection("admin_sessions").document(digest).delete()
+    audit("logout")
+    r=jsonify(ok=True); r.delete_cookie("admin_session",path="/"); return r
+
+@app.post("/api/admin/sessions/revoke-all")
+@admin_required
+def revoke_all_sessions():
+    sessions=list(firestore_db().collection("admin_sessions").limit(500).stream())
+    batch=firestore_db().batch()
+    for snapshot in sessions:
+        batch.delete(snapshot.reference)
+    batch.commit()
+    _ADMIN_SESSION_CACHE.clear()
+    audit("all_sessions_revoked",{"count":len(sessions)})
+    response=jsonify(ok=True,count=len(sessions))
+    response.delete_cookie("admin_session",path="/")
+    return response
 
 @app.get("/api/admin/orders")
 @admin_required
@@ -376,6 +494,7 @@ def export_admin_excel():
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     rows=[snapshot.to_dict() for snapshot in firestore_db().collection("orders").stream()]
+    audit("export_excel",{"records":len(rows)})
     rows.sort(key=lambda row:int(row.get("created_at",0)), reverse=True)
     status_labels={"pending":"Pendiente","approved":"Aprobada","rejected":"Rechazada","expired":"Vencida"}
     lima=ZoneInfo("America/Lima")
@@ -554,6 +673,7 @@ def approve(oid):
         for number in order.get("tickets",[]):
             batch.update(firestore_db().collection("tickets").document(str(number)), {"status":"confirmed"})
         batch.commit()
+        audit("order_approved",{"order_id":oid,"order_code":order.get("code")})
         return jsonify(ok=True,message="Pago aprobado y tickets confirmados",tickets=order.get("tickets",[]))
 
     # Una reserva vencida ya liberó sus números. Recuperamos los disponibles
@@ -613,6 +733,7 @@ def approve(oid):
             message="Pago vencido aprobado con los números originales"
             if result["replacements"]:
                 message="Pago vencido aprobado; se asignaron números de reemplazo"
+            audit("expired_order_approved",{"order_id":oid,"order_code":order.get("code")})
             return jsonify(ok=True,message=message,**result)
     return jsonify(error="No se pudieron reservar números disponibles. Intenta nuevamente"),409
 
@@ -633,6 +754,7 @@ def reject(oid):
     for number in order.get("tickets",[]):
         batch.delete(firestore_db().collection("tickets").document(str(number)))
     batch.commit()
+    audit("order_rejected",{"order_id":oid,"order_code":order.get("code")})
     return jsonify(ok=True)
 
 @app.post("/api/admin/orders/delete-selected")
@@ -681,6 +803,7 @@ def delete_selected_orders():
                 # recuperable configurada y este aviso permite revisar el objeto.
                 proof_warnings.append(oid)
 
+    audit("orders_deleted",{"order_ids":deleted,"count":len(deleted)})
     return jsonify(ok=True,deleted=deleted,not_found=not_found,
                    proof_warnings=proof_warnings,count=len(deleted))
 
