@@ -142,13 +142,15 @@ footer{background:#030305;color:#777;text-align:center;padding:35px;font-size:12
 </section>
 
 <section class="section light" id="consulta">
-<div class="head"><div class="tag">🔎 CONSULTA</div><h2>Consulta tus tickets</h2><p>Filtra por tu documento para ver todos los tickets asociados.</p></div>
+<div class="head"><div class="tag">🔎 CONSULTA</div><h2>Consulta tus tickets</h2><p>Por seguridad, ingresa tu documento y el WhatsApp utilizado en la compra.</p></div>
 <div style="max-width:700px;margin:auto;background:#fff;border:1px solid #ddd7c8;border-radius:18px;padding:24px">
-<div style="display:grid;grid-template-columns:.8fr 1.2fr;gap:12px">
+<div style="display:grid;grid-template-columns:.8fr 1.2fr 1.2fr;gap:12px">
 <div class="field" style="margin:0"><label for="queryDocumentType">Tipo de documento</label>
 <select id="queryDocumentType" onchange="updateDocumentPlaceholder()"><option value="DNI">DNI</option><option value="CE">Carnet de Extranjería</option></select></div>
 <div class="field" style="margin:0"><label for="queryDocumentNumber">Número de documento</label>
-<input id="queryDocumentNumber" type="text" inputmode="numeric" placeholder="8 dígitos"></div></div>
+<input id="queryDocumentNumber" type="text" inputmode="numeric" placeholder="8 dígitos"></div>
+<div class="field" style="margin:0"><label for="queryPhone">Número de WhatsApp</label>
+<input id="queryPhone" type="tel" inputmode="numeric" maxlength="9" placeholder="9 dígitos"></div></div>
 <button onclick="lookupByDocument()" style="width:100%;margin-top:14px;padding:16px;border:0;border-radius:10px;background:#0a7c4b;color:white;font-weight:900;cursor:pointer">CONSULTAR TODOS MIS TICKETS</button>
 <div id="documentQueryResult" style="margin-top:20px"></div></div>
 <div style="max-width:700px;margin:35px auto 0"><div style="font-weight:900;margin-bottom:10px">Consulta rápida por número de ticket</div>
@@ -320,10 +322,11 @@ async function submitOrder(){
 
 function updateDocumentPlaceholder(){const t=document.getElementById('queryDocumentType').value,i=document.getElementById('queryDocumentNumber');i.placeholder=t==='DNI'?'8 dígitos':'Número de Carnet de Extranjería';i.maxLength=t==='DNI'?8:12;i.value=''}
 async function lookupByDocument(){
- const t=document.getElementById('queryDocumentType').value,n=document.getElementById('queryDocumentNumber').value.trim(),b=document.getElementById('documentQueryResult');
+ const t=document.getElementById('queryDocumentType').value,n=document.getElementById('queryDocumentNumber').value.trim(),phone=document.getElementById('queryPhone').value.replace(/\D/g,''),b=document.getElementById('documentQueryResult');
  if((t==='DNI'&&!/^\d{8}$/.test(n))||(t==='CE'&&!/^\d{6,12}$/.test(n))){b.innerHTML='<div class="note">Ingresa un documento válido.</div>';return}
+ if(!/^9\d{8}$/.test(phone)){b.innerHTML='<div class="note">Ingresa el WhatsApp utilizado en la compra.</div>';return}
  b.innerHTML='<div class="note">Buscando todos tus tickets…</div>';
- try{const r=await fetch('/api/tickets/by-document?document_type='+encodeURIComponent(t)+'&document_number='+encodeURIComponent(n)),d=await r.json();if(!r.ok)throw Error(d.error||'No encontrado');
+ try{const r=await fetch('/api/tickets/by-document?document_type='+encodeURIComponent(t)+'&document_number='+encodeURIComponent(n)+'&phone='+encodeURIComponent(phone)),d=await r.json();if(!r.ok)throw Error(d.error||'No encontrado');
  let h='<div style="padding:16px;border-radius:14px;background:#f7faf7;border:1px solid #cbd9cf"><b>'+escapeHtml(t==='DNI'?'DNI':'Carnet de Extranjería')+' '+escapeHtml(n)+'</b><div style="margin-top:6px">Compras: '+d.total_orders+' · Tickets: '+d.total_tickets+'</div></div>';
  d.orders.forEach(o=>{h+='<div style="margin-top:14px;padding:18px;border-radius:14px;background:#fff;border:1px solid #d7ddd7"><b>Solicitud '+escapeHtml(o.order_code)+'</b><div>Estado: '+escapeHtml(o.status_label)+'</div><div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'+o.tickets.map(x=>'<span class="ticket-pill">#'+x.number+'</span>').join('')+'</div></div>'});b.innerHTML=h
  }catch(e){b.innerHTML='<div class="note" style="color:#b33">'+escapeHtml(e.message)+'</div>'}
@@ -343,6 +346,7 @@ async function lookupTicket(){
 }
 function escapeHtml(s){return s.replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
 updateDocumentPlaceholder();
+document.getElementById('queryPhone').addEventListener('input',event=>{event.target.value=event.target.value.replace(/\D/g,'').slice(0,9)});
 </script>
 
 
