@@ -20,6 +20,7 @@ PUBLIC = BASE / "public"
 
 app = Flask(__name__, static_folder=str(PUBLIC), static_url_path="")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+app.config["MAX_CONTENT_LENGTH"]=25*1024*1024
 app.secret_key = os.environ.get("FLASK_SECRET", "CHANGE_THIS_SECRET_IN_PRODUCTION")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "CAMBIA_ESTA_CLAVE")
@@ -291,7 +292,7 @@ def create_order():
     document_number=(request.form.get("document_number") or "").strip()
     try: quantity=int(request.form.get("quantity","1"))
     except: quantity=0
-    proof=request.files.get("proof")
+    proofs=[item for item in request.files.getlist("proof") if item and item.filename]
     if not name or len(name)>120: return jsonify(error="Nombre inválido"),400
     if not re.fullmatch(r"9\d{8}", phone):
         return jsonify(error="Número de WhatsApp inválido"),400
@@ -300,32 +301,33 @@ def create_order():
     if document_type=="DNI" and len(document_number)!=8: return jsonify(error="El DNI debe tener 8 dígitos"),400
     if document_type=="CE" and not 6<=len(document_number)<=12: return jsonify(error="El Carnet de Extranjería debe tener entre 6 y 12 dígitos"),400
     if quantity<1 or quantity>50: return jsonify(error="Cantidad inválida"),400
-    if not proof: return jsonify(error="Falta el comprobante"),400
-    if proof.mimetype not in {"image/jpeg","image/png","image/webp"}: return jsonify(error="Formato no permitido"),400
-    raw=proof.read()
-    if len(raw)>5*1024*1024: return jsonify(error="Comprobante demasiado grande"),400
-    try:
-        from PIL import Image, UnidentifiedImageError
-        Image.MAX_IMAGE_PIXELS=25_000_000
-        source=Image.open(BytesIO(raw))
-        source.verify()
-        source=Image.open(BytesIO(raw))
-        if getattr(source,"is_animated",False):
-            return jsonify(error="No se permiten imágenes animadas"),400
-        source.load()
-        output=BytesIO()
-        if proof.mimetype=="image/png":
-            source.convert("RGBA" if "A" in source.getbands() else "RGB").save(output,"PNG",optimize=True)
-            ext=".png"; verified_type="image/png"
-        elif proof.mimetype=="image/webp":
-            source.convert("RGB").save(output,"WEBP",quality=88,method=4)
-            ext=".webp"; verified_type="image/webp"
-        else:
-            source.convert("RGB").save(output,"JPEG",quality=90,optimize=True)
-            ext=".jpg"; verified_type="image/jpeg"
-        raw=output.getvalue()
-    except Exception:
-        return jsonify(error="El archivo no es una imagen válida"),400
+    if not proofs: return jsonify(error="Falta el comprobante"),400
+    if len(proofs)>5: return jsonify(error="Puedes adjuntar como máximo 5 comprobantes"),400
+    normalized_proofs=[]
+    for proof in proofs:
+        if proof.mimetype not in {"image/jpeg","image/png","image/webp"}:
+            return jsonify(error="Todos los comprobantes deben ser imágenes JPG, PNG o WEBP"),400
+        raw=proof.read()
+        if len(raw)>5*1024*1024: return jsonify(error="Cada comprobante puede pesar como máximo 5 MB"),400
+        try:
+            from PIL import Image
+            Image.MAX_IMAGE_PIXELS=25_000_000
+            source=Image.open(BytesIO(raw)); source.verify(); source=Image.open(BytesIO(raw))
+            if getattr(source,"is_animated",False):
+                return jsonify(error="No se permiten imágenes animadas"),400
+            source.load(); output=BytesIO()
+            if proof.mimetype=="image/png":
+                source.convert("RGBA" if "A" in source.getbands() else "RGB").save(output,"PNG",optimize=True)
+                ext=".png"; verified_type="image/png"
+            elif proof.mimetype=="image/webp":
+                source.convert("RGB").save(output,"WEBP",quality=88,method=4)
+                ext=".webp"; verified_type="image/webp"
+            else:
+                source.convert("RGB").save(output,"JPEG",quality=90,optimize=True)
+                ext=".jpg"; verified_type="image/jpeg"
+            normalized_proofs.append((output.getvalue(),ext,verified_type))
+        except Exception:
+            return jsonify(error="Uno de los archivos no es una imagen válida"),400
 
     code=make_code()
     oid=str(int(time.time()*1000)*100+secrets.randbelow(100))
@@ -334,6 +336,7 @@ def create_order():
     orders=firestore_db().collection("orders")
     tickets=firestore_db().collection("tickets")
     nums=[]
+    uploaded_proofs=[]
     try:
         # Reserva todos los números y crea la solicitud en una sola transacción.
         for _ in range(12):
@@ -353,7 +356,7 @@ def create_order():
                     "id":oid, "code":code, "name":name, "phone":phone,
                     "document_type":document_type, "document_number":document_number,
                     "quantity":quantity, "total":quantity*PRICE,
-                    "proof_path":None, "status":"pending", "tickets":candidates,
+                    "proof_path":None,"proof_paths":[], "status":"pending", "tickets":candidates,
                     "created_at":now, "created_at_text":created_at_text,
                     "reviewed_at":None, "reviewed_at_text":None, "review_note":None,
                 })
@@ -369,11 +372,14 @@ def create_order():
         if not nums:
             raise RuntimeError("No se pudieron reservar números únicos")
 
-        # El nombre del objeto no contiene DNI, teléfono ni nombre del comprador.
-        filename=f"proof_{secrets.token_hex(24)}{ext}"
-        blob=storage_bucket().blob(filename)
-        blob.upload_from_string(raw, content_type=verified_type)
-        orders.document(oid).update({"proof_path":filename})
+        # Los nombres no contienen DNI, teléfono ni nombre del comprador.
+        for raw,ext,verified_type in normalized_proofs:
+            filename=f"proof_{secrets.token_hex(24)}{ext}"
+            blob=storage_bucket().blob(filename)
+            blob.upload_from_string(raw, content_type=verified_type)
+            uploaded_proofs.append(filename)
+        orders.document(oid).update({"proof_path":uploaded_proofs[0],
+                                     "proof_paths":uploaded_proofs})
     except Exception:
         # Si falla la imagen, libera la reserva para no dejar tickets bloqueados.
         if nums:
@@ -382,8 +388,12 @@ def create_order():
             for number in nums:
                 batch.delete(tickets.document(str(number)))
             batch.commit()
+        for filename in uploaded_proofs:
+            try: storage_bucket().blob(filename).delete()
+            except Exception: pass
         return jsonify(error="No se pudo crear la solicitud"),500
-    return jsonify(order_code=code,quantity=quantity,total=quantity*PRICE,tickets=nums,status="pending"),201
+    return jsonify(order_code=code,quantity=quantity,total=quantity*PRICE,tickets=nums,
+                   proof_count=len(uploaded_proofs),status="pending"),201
 
 @app.get("/api/tickets/<number>")
 @limiter.limit("30 per minute")
@@ -538,7 +548,9 @@ def admin_orders():
     for row in rows:
         row["created_at"]=lima_datetime_text(row.get("created_at")) or row.get("created_at_text","")
         row["tickets"]=sorted(row.get("tickets",[]) or row.get("released_tickets",[]))
-        row["proof_url"]="/admin/proof/"+row["proof_path"] if row.get("proof_path") else None
+        proof_paths=row.get("proof_paths") or ([row.get("proof_path")] if row.get("proof_path") else [])
+        row["proof_urls"]=["/admin/proof/"+path for path in proof_paths if path]
+        row["proof_url"]=row["proof_urls"][0] if row["proof_urls"] else None
     return jsonify(orders=rows)
 
 @app.get("/api/admin/export.xlsx")
@@ -641,17 +653,27 @@ def export_admin_excel():
     summary.freeze_panes="A4"
 
     headers=["Código de solicitud","Nombre completo","Número de WhatsApp","Tipo de documento",
-             "Número de documento","Cantidad","Total (S/)","Estado","Tickets confirmados/asignados",
+             "Número de documento","Cantidad","Total (S/)","Omar (S/)","Franci (S/)","Estado","Tickets confirmados/asignados",
              "Tickets originales/liberados","Fecha de registro","Fecha de revisión","Observación",
              "Reactivada desde vencida"]
     detail.append(headers)
     for row in rows:
         current_tickets=row.get("tickets",[]) or []
         historical=row.get("original_tickets",[]) or row.get("released_tickets",[]) or current_tickets
+        approved_total=int(row.get("total",0)) if row.get("status")=="approved" else None
+        amount_omar=row.get("payment_amount_omar")
+        amount_franci=row.get("payment_amount_franci")
+        # Compatibilidad con pagos aprobados antes de permitir montos divididos.
+        if approved_total is not None and amount_omar is None and amount_franci is None:
+            amount_omar=approved_total if row.get("payment_recipient")=="omar" else None
+            amount_franci=approved_total if row.get("payment_recipient")=="franci" else None
         detail.append([
             safe_excel_text(row.get("code")),safe_excel_text(row.get("name")),safe_excel_text(row.get("phone")),
             safe_excel_text(row.get("document_type")),safe_excel_text(row.get("document_number")),
-            int(row.get("quantity",0)),int(row.get("total",0)),status_labels.get(row.get("status"),row.get("status","")),
+            int(row.get("quantity",0)),int(row.get("total",0)),
+            int(amount_omar) if amount_omar not in {None,0} else None,
+            int(amount_franci) if amount_franci not in {None,0} else None,
+            status_labels.get(row.get("status"),row.get("status","")),
             ", ".join(str(number) for number in current_tickets),
             ", ".join(str(number) for number in historical),
             local_datetime(row.get("created_at")),local_datetime(row.get("reviewed_at")),
@@ -664,7 +686,7 @@ def export_admin_excel():
         cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
         cell.border=Border(bottom=thin)
     for row in detail.iter_rows(min_row=2):
-        status=row[7].value
+        status=row[9].value
         for cell in row:
             cell.alignment=Alignment(vertical="top",wrap_text=True)
             cell.border=Border(bottom=thin)
@@ -674,16 +696,16 @@ def export_admin_excel():
                        "Rechazada":("FEE2E2","991B1B"),"Vencida":("E5E7EB","374151")}
         if status in status_colors:
             fill_color,font_color=status_colors[status]
-            row[7].fill=PatternFill("solid",fgColor=fill_color)
-            row[7].font=Font(bold=True,color=font_color)
-        row[6].number_format='"S/" #,##0'
-        row[10].number_format='dd/mm/yyyy hh:mm'
-        row[11].number_format='dd/mm/yyyy hh:mm'
-    widths=[20,32,20,18,20,12,14,16,30,30,21,21,48,23]
+            row[9].fill=PatternFill("solid",fgColor=fill_color)
+            row[9].font=Font(bold=True,color=font_color)
+        for currency_cell in row[6:9]: currency_cell.number_format='"S/" #,##0'
+        row[12].number_format='dd/mm/yyyy hh:mm'
+        row[13].number_format='dd/mm/yyyy hh:mm'
+    widths=[20,32,20,18,20,12,14,14,14,16,30,30,21,21,48,23]
     for index,width in enumerate(widths,1):
         detail.column_dimensions[chr(64+index)].width=width
     detail.freeze_panes="A2"
-    detail.auto_filter.ref=f"A1:N{max(detail.max_row,1)}"
+    detail.auto_filter.ref=f"A1:P{max(detail.max_row,1)}"
 
     output=BytesIO()
     workbook.save(output)
@@ -721,12 +743,20 @@ def approve(oid):
     now=int(time.time())
     reviewed_at_text=time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(now))
     requested_note=(request.json or {}).get("note") or "Pago validado"
+    data=request.json or {}
+    try:
+        amount_omar=int(data.get("amount_omar",0)); amount_franci=int(data.get("amount_franci",0))
+    except (TypeError,ValueError):
+        return jsonify(error="Los montos de Omar y Franci deben ser números enteros"),400
+    if amount_omar<0 or amount_franci<0 or amount_omar+amount_franci!=int(order.get("total",0)):
+        return jsonify(error=f"Los montos de Omar y Franci deben sumar S/{order.get('total',0)}"),400
 
     if order["status"]=="pending":
         batch=firestore_db().batch()
         batch.update(ref, {"status":"approved", "reviewed_at":now,
                            "reviewed_at_text":reviewed_at_text,
-                           "review_note":requested_note})
+                           "review_note":requested_note,"payment_amount_omar":amount_omar,
+                           "payment_amount_franci":amount_franci,"payment_recipient":None})
         for number in order.get("tickets",[]):
             batch.update(firestore_db().collection("tickets").document(str(number)), {"status":"confirmed"})
         batch.commit()
@@ -775,7 +805,8 @@ def approve(oid):
                                     "reviewed_at":now, "reviewed_at_text":reviewed_at_text,
                                     "review_note":history_note,
                                     "reactivated_from_expired":True,
-                                    "original_tickets":original})
+                                    "original_tickets":original,"payment_amount_omar":amount_omar,
+                                    "payment_amount_franci":amount_franci,"payment_recipient":None})
             for number in selected:
                 transaction.set(tickets_collection.document(str(number)),{
                     "number":number, "order_id":oid, "order_code":order.get("code"),
@@ -808,12 +839,38 @@ def reject(oid):
     batch.update(ref, {"status":"rejected", "reviewed_at":now,
                        "reviewed_at_text":time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(now)),
                        "review_note":(request.json or {}).get("note") or "Pago rechazado",
+                       "payment_recipient":None,
+                       "payment_amount_omar":None,"payment_amount_franci":None,
                        "released_tickets":order.get("tickets",[]), "tickets":[]})
     for number in order.get("tickets",[]):
         batch.delete(firestore_db().collection("tickets").document(str(number)))
     batch.commit()
     audit("order_rejected",{"order_id":oid,"order_code":order.get("code")})
     return jsonify(ok=True)
+
+@app.patch("/api/admin/orders/<oid>/recipient")
+@admin_required
+@roles_allowed("owner","validator")
+def update_payment_recipient(oid):
+    ref=firestore_db().collection("orders").document(oid)
+    snapshot=ref.get()
+    if not snapshot.exists: return jsonify(error="Solicitud no encontrada"),404
+    order=snapshot.to_dict() or {}
+    if order.get("status")!="approved":
+        return jsonify(error="Solo se puede asignar la cuenta a pagos aprobados"),400
+    data=request.json or {}
+    try:
+        amount_omar=int(data.get("amount_omar",0)); amount_franci=int(data.get("amount_franci",0))
+    except (TypeError,ValueError):
+        return jsonify(error="Los montos deben ser números enteros"),400
+    if amount_omar<0 or amount_franci<0 or amount_omar+amount_franci!=int(order.get("total",0)):
+        return jsonify(error=f"Omar y Franci deben sumar S/{order.get('total',0)}"),400
+    ref.update({"payment_amount_omar":amount_omar,"payment_amount_franci":amount_franci,
+                "payment_recipient":None,"recipient_updated_at":int(time.time()),
+                "recipient_updated_by":g.admin_user})
+    audit("payment_recipient_updated",{"order_id":oid,"order_code":order.get("code"),
+                                        "amount_omar":amount_omar,"amount_franci":amount_franci})
+    return jsonify(ok=True,amount_omar=amount_omar,amount_franci=amount_franci)
 
 @app.post("/api/admin/orders/delete-selected")
 @admin_required
@@ -853,8 +910,8 @@ def delete_selected_orders():
         batch.commit()
         deleted.append(oid)
 
-        proof_path=order.get("proof_path")
-        if proof_path:
+        proof_paths=order.get("proof_paths") or ([order.get("proof_path")] if order.get("proof_path") else [])
+        for proof_path in dict.fromkeys(path for path in proof_paths if path):
             try:
                 storage_bucket().blob(proof_path).delete()
             except Exception:
