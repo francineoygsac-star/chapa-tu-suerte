@@ -1,17 +1,19 @@
 
-import os, secrets, hmac, time, mimetypes, json, urllib.request, urllib.error, re, unicodedata, hashlib
+import os, secrets, hmac, time, mimetypes, json, urllib.request, urllib.error, re, unicodedata, hashlib, base64
 from collections import defaultdict, deque
 from io import BytesIO
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from functools import wraps
-from flask import Flask, request, jsonify, send_from_directory, make_response, redirect, session, send_file
+from flask import Flask, request, jsonify, send_from_directory, make_response, redirect, session, send_file, g
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from google.cloud import storage
 from google.cloud import firestore
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.security import generate_password_hash, check_password_hash
+from cryptography.fernet import Fernet, InvalidToken
 
 BASE = Path(__file__).resolve().parent
 PUBLIC = BASE / "public"
@@ -40,11 +42,22 @@ def rate_limited(_error):
 def token_digest(value):
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
+def credential_cipher():
+    """Cifra los secretos TOTP de usuarios secundarios antes de guardarlos."""
+    key=base64.urlsafe_b64encode(hashlib.sha256(app.secret_key.encode("utf-8")).digest())
+    return Fernet(key)
+
+def encrypt_totp(secret):
+    return credential_cipher().encrypt(secret.encode("ascii")).decode("ascii")
+
+def decrypt_totp(encrypted):
+    return credential_cipher().decrypt(str(encrypted).encode("ascii")).decode("ascii")
+
 def audit(action, details=None, actor=None):
     """Registra acciones sensibles sin guardar contraseñas, tokens ni comprobantes."""
     try:
         firestore_db().collection("admin_audit").add({
-            "action":str(action)[:80], "actor":str(actor or ADMIN_USER)[:80],
+            "action":str(action)[:80], "actor":str(actor or getattr(g,"admin_user",None) or ADMIN_USER)[:80],
             "ip":get_remote_address(), "created_at":int(time.time()),
             "details":details or {},
         })
@@ -138,8 +151,11 @@ def admin_required(fn):
                 _ADMIN_SESSION_CACHE.pop(digest,None)
                 return jsonify(error="No autorizado"),401
             saved=snapshot.to_dict() or {}
-            cached={"cached_until":now+300,"csrf_hash":saved.get("csrf_hash","")}
+            cached={"cached_until":now+300,"csrf_hash":saved.get("csrf_hash",""),
+                    "actor":saved.get("actor",ADMIN_USER),"role":saved.get("role","owner")}
             _ADMIN_SESSION_CACHE[digest]=cached
+        g.admin_user=str(cached.get("actor") or ADMIN_USER)
+        g.admin_role=str(cached.get("role") or "viewer")
         if request.method not in {"GET","HEAD","OPTIONS"}:
             csrf=request.headers.get("X-CSRF-Token","")
             if (not same_origin_request() or not csrf or
@@ -147,6 +163,16 @@ def admin_required(fn):
                 return jsonify(error="Solicitud de seguridad inválida. Vuelve a iniciar sesión."),403
         return fn(*args, **kwargs)
     return wrapper
+
+def roles_allowed(*roles):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args,**kwargs):
+            if getattr(g,"admin_role",None) not in roles:
+                return jsonify(error="No tienes permiso para realizar esta acción"),403
+            return fn(*args,**kwargs)
+        return wrapper
+    return decorator
 
 @app.get("/")
 def home():
@@ -423,26 +449,54 @@ def login():
     data=request.form or request.json or {}
     if ADMIN_PASSWORD=="CAMBIA_ESTA_CLAVE" or app.secret_key=="CHANGE_THIS_SECRET_IN_PRODUCTION":
         return jsonify(error="La seguridad del administrador no está configurada"),503
-    valid_user=hmac.compare_digest(str(data.get("username","")),ADMIN_USER)
-    valid_password=hmac.compare_digest(str(data.get("password","")),ADMIN_PASSWORD)
-    valid_totp=True
-    if ADMIN_TOTP_SECRET:
+    import pyotp
+    supplied_user=str(data.get("username","")).strip()
+    supplied_password=str(data.get("password",""))
+    supplied_totp=str(data.get("totp","")).strip()
+    actor=None; role=None; valid_password=False; valid_totp=False; user_ref=None
+
+    normalized=supplied_user.lower()
+    if re.fullmatch(r"[a-z0-9._-]{3,32}",normalized):
+        user_ref=firestore_db().collection("admin_users").document(normalized)
+        user_snapshot=user_ref.get()
+        if user_snapshot.exists:
+            user_data=user_snapshot.to_dict() or {}
+            actor=str(user_data.get("username") or normalized)
+            role=str(user_data.get("role") or "viewer")
+            valid_password=bool(user_data.get("active",False)) and check_password_hash(
+                str(user_data.get("password_hash") or ""),supplied_password)
+            try:
+                secret=decrypt_totp(user_data.get("totp_secret_encrypted",""))
+                valid_totp=pyotp.TOTP(secret).verify(supplied_totp,valid_window=1)
+            except Exception:
+                valid_totp=False
+
+    # La cuenta original de Render permanece como administrador principal.
+    if actor is None and hmac.compare_digest(supplied_user,ADMIN_USER):
+        actor=ADMIN_USER; role="owner"; user_ref=None
+        valid_password=hmac.compare_digest(supplied_password,ADMIN_PASSWORD)
         try:
-            import pyotp
-            valid_totp=pyotp.TOTP(ADMIN_TOTP_SECRET).verify(str(data.get("totp","")),valid_window=1)
+            valid_totp=bool(ADMIN_TOTP_SECRET) and pyotp.TOTP(ADMIN_TOTP_SECRET).verify(
+                supplied_totp,valid_window=1)
         except Exception:
             valid_totp=False
-    if not (valid_user and valid_password and valid_totp):
+    if not (actor and valid_password and valid_totp):
         audit("login_failed",{"username":str(data.get("username", ""))[:80]},actor="unknown")
+        return jsonify(error="Credenciales incorrectas"),401
+    if role not in {"owner","validator","viewer"}:
         return jsonify(error="Credenciales incorrectas"),401
     token=secrets.token_urlsafe(32)
     csrf=secrets.token_urlsafe(32)
     digest=token_digest(token)
-    saved={"created_at":int(time.time()),"csrf_hash":token_digest(csrf),"actor":ADMIN_USER}
+    now=int(time.time())
+    saved={"created_at":now,"csrf_hash":token_digest(csrf),"actor":actor,"role":role}
     firestore_db().collection("admin_sessions").document(digest).set(saved)
-    _ADMIN_SESSION_CACHE[digest]={"cached_until":int(time.time())+300,"csrf_hash":saved["csrf_hash"]}
-    audit("login_success")
-    r=jsonify(ok=True,csrf_token=csrf,totp_enabled=bool(ADMIN_TOTP_SECRET))
+    _ADMIN_SESSION_CACHE[digest]={"cached_until":now+300,"csrf_hash":saved["csrf_hash"],
+                                  "actor":actor,"role":role}
+    if user_ref is not None:
+        user_ref.update({"last_login_at":now})
+    audit("login_success",{"role":role},actor=actor)
+    r=jsonify(ok=True,csrf_token=csrf,totp_enabled=True,user=actor,role=role)
     r.set_cookie("admin_session",token,httponly=True,samesite="Strict",secure=True,max_age=86400,path="/")
     return r
 
@@ -459,6 +513,7 @@ def logout():
 
 @app.post("/api/admin/sessions/revoke-all")
 @admin_required
+@roles_allowed("owner")
 def revoke_all_sessions():
     sessions=list(firestore_db().collection("admin_sessions").limit(500).stream())
     batch=firestore_db().batch()
@@ -488,6 +543,7 @@ def admin_orders():
 
 @app.get("/api/admin/export.xlsx")
 @admin_required
+@roles_allowed("owner")
 def export_admin_excel():
     # Estas librerías son pesadas; se cargan solo cuando se descarga el Excel,
     # no durante el arranque normal de la web ni del panel.
@@ -654,6 +710,7 @@ def proof(filename):
 
 @app.post("/api/admin/orders/<oid>/approve")
 @admin_required
+@roles_allowed("owner","validator")
 def approve(oid):
     ref=firestore_db().collection("orders").document(oid)
     snapshot=ref.get()
@@ -739,6 +796,7 @@ def approve(oid):
 
 @app.post("/api/admin/orders/<oid>/reject")
 @admin_required
+@roles_allowed("owner","validator")
 def reject(oid):
     ref=firestore_db().collection("orders").document(oid)
     snapshot=ref.get()
@@ -759,6 +817,7 @@ def reject(oid):
 
 @app.post("/api/admin/orders/delete-selected")
 @admin_required
+@roles_allowed("owner")
 def delete_selected_orders():
     data=request.json or {}
     raw_ids=data.get("ids") or []
@@ -806,6 +865,119 @@ def delete_selected_orders():
     audit("orders_deleted",{"order_ids":deleted,"count":len(deleted)})
     return jsonify(ok=True,deleted=deleted,not_found=not_found,
                    proof_warnings=proof_warnings,count=len(deleted))
+
+def valid_admin_password(password):
+    return (len(password)>=14 and re.search(r"[a-z]",password) and
+            re.search(r"[A-Z]",password) and re.search(r"\d",password) and
+            re.search(r"[^A-Za-z0-9]",password))
+
+def revoke_user_sessions(username):
+    snapshots=list(firestore_db().collection("admin_sessions").where(
+        "actor","==",username).limit(100).stream())
+    if snapshots:
+        batch=firestore_db().batch()
+        for snapshot in snapshots:
+            batch.delete(snapshot.reference)
+            _ADMIN_SESSION_CACHE.pop(snapshot.id,None)
+        batch.commit()
+    return len(snapshots)
+
+@app.get("/api/admin/users")
+@admin_required
+@roles_allowed("owner")
+def list_admin_users():
+    users=[{
+        "username":ADMIN_USER,"role":"owner","role_label":"ADMINISTRADOR PRINCIPAL",
+        "active":True,"source":"render","created_at":"Cuenta principal de Render",
+        "last_login_at":"",
+    }]
+    for snapshot in firestore_db().collection("admin_users").limit(100).stream():
+        row=snapshot.to_dict() or {}
+        users.append({
+            "username":row.get("username",snapshot.id),"role":row.get("role","viewer"),
+            "role_label":{"validator":"VALIDADOR DE PAGOS","viewer":"SOLO CONSULTA"}.get(
+                row.get("role"),"SOLO CONSULTA"),
+            "active":bool(row.get("active",False)),"source":"firestore",
+            "created_at":lima_datetime_text(row.get("created_at")),
+            "last_login_at":lima_datetime_text(row.get("last_login_at")),
+        })
+    return jsonify(users=users,current_user=g.admin_user,current_role=g.admin_role)
+
+@app.post("/api/admin/users")
+@admin_required
+@roles_allowed("owner")
+def create_admin_user():
+    import pyotp
+    data=request.json or {}
+    username=str(data.get("username","")).strip().lower()
+    password=str(data.get("password", ""))
+    role=str(data.get("role","")).strip()
+    if not re.fullmatch(r"[a-z0-9._-]{3,32}",username):
+        return jsonify(error="El usuario debe tener entre 3 y 32 caracteres: letras, números, punto, guion o guion bajo"),400
+    if username==ADMIN_USER.lower():
+        return jsonify(error="Ese usuario pertenece a la cuenta principal"),409
+    if role not in {"validator","viewer"}:
+        return jsonify(error="Selecciona un rol válido"),400
+    if not valid_admin_password(password):
+        return jsonify(error="La contraseña debe tener 14 caracteres, mayúscula, minúscula, número y símbolo"),400
+    ref=firestore_db().collection("admin_users").document(username)
+    if ref.get().exists:
+        return jsonify(error="Ese nombre de usuario ya existe"),409
+    secret=pyotp.random_base32()
+    now=int(time.time())
+    ref.set({
+        "username":username,"password_hash":generate_password_hash(password),
+        "totp_secret_encrypted":encrypt_totp(secret),"role":role,"active":True,
+        "created_at":now,"created_by":g.admin_user,"last_login_at":None,
+    })
+    audit("admin_user_created",{"username":username,"role":role})
+    uri=pyotp.TOTP(secret).provisioning_uri(name=username,issuer_name="Chapa Tu Suerte")
+    return jsonify(ok=True,username=username,role=role,totp_secret=secret,provisioning_uri=uri),201
+
+@app.patch("/api/admin/users/<username>")
+@admin_required
+@roles_allowed("owner")
+def update_admin_user(username):
+    username=str(username).strip().lower()
+    if username==ADMIN_USER.lower():
+        return jsonify(error="La cuenta principal se administra desde Render"),400
+    ref=firestore_db().collection("admin_users").document(username)
+    snapshot=ref.get()
+    if not snapshot.exists: return jsonify(error="Usuario no encontrado"),404
+    data=request.json or {}; updates={}
+    if "active" in data: updates["active"]=bool(data.get("active"))
+    if "role" in data:
+        if data.get("role") not in {"validator","viewer"}:
+            return jsonify(error="Rol inválido"),400
+        updates["role"]=data["role"]
+    if not updates: return jsonify(error="No hay cambios válidos"),400
+    updates["updated_at"]=int(time.time()); updates["updated_by"]=g.admin_user
+    ref.update(updates)
+    closed=revoke_user_sessions(username)
+    audit("admin_user_updated",{"username":username,"changes":list(updates.keys()),"sessions_closed":closed})
+    return jsonify(ok=True,sessions_closed=closed)
+
+@app.post("/api/admin/users/<username>/reset-security")
+@admin_required
+@roles_allowed("owner")
+def reset_admin_security(username):
+    import pyotp
+    username=str(username).strip().lower()
+    if username==ADMIN_USER.lower():
+        return jsonify(error="La cuenta principal se administra desde Render"),400
+    ref=firestore_db().collection("admin_users").document(username)
+    if not ref.get().exists: return jsonify(error="Usuario no encontrado"),404
+    password=str((request.json or {}).get("password", ""))
+    if not valid_admin_password(password):
+        return jsonify(error="La contraseña debe tener 14 caracteres, mayúscula, minúscula, número y símbolo"),400
+    secret=pyotp.random_base32()
+    ref.update({"password_hash":generate_password_hash(password),
+                "totp_secret_encrypted":encrypt_totp(secret),"active":True,
+                "security_reset_at":int(time.time()),"security_reset_by":g.admin_user})
+    closed=revoke_user_sessions(username)
+    audit("admin_user_security_reset",{"username":username,"sessions_closed":closed})
+    uri=pyotp.TOTP(secret).provisioning_uri(name=username,issuer_name="Chapa Tu Suerte")
+    return jsonify(ok=True,username=username,totp_secret=secret,provisioning_uri=uri)
 
 @app.get("/api/admin/stats")
 @admin_required
