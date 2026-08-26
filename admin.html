@@ -10,7 +10,7 @@ body{font-family:Arial;margin:0;background:#07070b;color:#fff}.wrap{max-width:12
 <button onclick="login()" style="background:#ffd400">INGRESAR</button><div id="lm" style="margin-top:12px"></div></div>
 <div id="app" style="display:none"><div style="display:flex;justify-content:space-between;align-items:center"><h1>Solicitudes y tickets</h1><button onclick="logout()">SALIR</button></div>
 <div class="grid" id="stats"></div>
-<div class="toolbar" style="margin:18px 0"><button onclick="load('all')">TODAS</button><button onclick="load('pending')">PENDIENTES</button><button onclick="load('approved')">APROBADAS</button><button onclick="load('rejected')">RECHAZADAS</button><button onclick="load('expired')">VENCIDAS</button><button onclick="downloadExcel()" style="background:#168b4b;color:#fff">📊 DESCARGAR EXCEL</button></div>
+<div class="toolbar" style="margin:18px 0"><button onclick="load('all')">TODAS</button><button onclick="load('pending')">PENDIENTES</button><button onclick="load('approved')">APROBADAS</button><button onclick="load('rejected')">RECHAZADAS</button><button onclick="load('expired')">VENCIDAS</button><button onclick="downloadExcel()" style="background:#168b4b;color:#fff">📊 DESCARGAR EXCEL</button><button onclick="deleteSelected()" style="background:#8f1425;color:#fff">🗑 ELIMINAR SELECCIONADAS</button></div>
 <div id="orders"></div></div></div>
 <script>
 async function login(){let r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u.value,password:p.value})});let d=await r.json();if(!r.ok){lm.textContent=d.error;return}document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';load('pending');stats();}
@@ -19,6 +19,7 @@ function downloadExcel(){window.location.href='/api/admin/export.xlsx'}
 async function stats(){let r=await fetch('/api/admin/stats');if(!r.ok)return;let d=await r.json();document.getElementById('stats').innerHTML=[['Pendientes',d.pending],['Aprobadas',d.approved],['Rechazadas',d.rejected],['Tickets confirmados',d.confirmed_tickets],['Ventas aprobadas','S/'+d.sales_approved]].map(x=>'<div class="stat">'+x[0]+'<b>'+x[1]+'</b></div>').join('')}
 let proofObserver;
 let currentOrders=[];
+let currentStatus='pending';
 const statusLabels={pending:'PENDIENTE',approved:'APROBADA',rejected:'RECHAZADA',expired:'VENCIDA'};
 function sendWhatsApp(id){
   const o=currentOrders.find(item=>String(item.id)===String(id));
@@ -47,6 +48,22 @@ function sendWhatsApp(id){
   if((o.status==='rejected'||o.status==='expired')&&o.review_note)lines.push('Observación: '+o.review_note);
   window.open('https://wa.me/51'+phone+'?text='+encodeURIComponent(lines.join('\n')),'_blank','noopener');
 }
+async function deleteSelected(){
+  const ids=[...document.querySelectorAll('.order-select:checked')].map(input=>input.value);
+  if(!ids.length){alert('Marca primero las compras de prueba que deseas eliminar.');return}
+  const answer=prompt('Esta acción eliminará permanentemente '+ids.length+' compra(s), sus tickets y comprobantes.\n\nEscribe ELIMINAR para confirmar:');
+  if(answer!=='ELIMINAR')return;
+  const r=await fetch('/api/admin/orders/delete-selected',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ids,confirmation:'ELIMINAR'})
+  });
+  const d=await r.json();
+  if(!r.ok){alert(d.error||'No se pudieron eliminar las compras.');return}
+  let message='Se eliminaron '+d.count+' compra(s) de prueba.';
+  if(d.proof_warnings&&d.proof_warnings.length)message+='\nAlgunos comprobantes requieren revisión en el bucket.';
+  alert(message);
+  await Promise.all([load(currentStatus),stats()]);
+}
 function activateProofs(){
   if(proofObserver)proofObserver.disconnect();
   proofObserver=new IntersectionObserver(entries=>entries.forEach(entry=>{
@@ -59,13 +76,14 @@ function activateProofs(){
   document.querySelectorAll('img[data-src]').forEach(img=>proofObserver.observe(img));
 }
 async function load(status){
+  currentStatus=status;
   const container=document.getElementById('orders');
   container.innerHTML='<div class="loading">Cargando solicitudes y comprobantes…</div>';
   let r=await fetch('/api/admin/orders?status='+encodeURIComponent(status));
   if(r.status===401){document.getElementById('login').style.display='block';document.getElementById('app').style.display='none';return}
   let d=await r.json();
   currentOrders=d.orders;
-  container.innerHTML=d.orders.map(o=>'<div class="card order"><div><h2>'+esc(o.code)+' <span class="badge">'+esc(statusLabels[o.status]||o.status.toUpperCase())+'</span></h2><p><b>'+esc(o.name)+'</b> · '+esc(o.phone)+' · '+o.quantity+' ticket(s) · S/'+o.total+'</p><p>Creado: '+esc(o.created_at)+' <span class="badge">HORA PERÚ</span></p><div class="tickets">'+o.tickets.map(t=>'<span class="ticket">#'+t+'</span>').join('')+'</div>'+(o.proof_url?'<a class="proof-wrap" href="'+encodeURI(o.proof_url)+'" target="_blank" title="Abrir comprobante completo"><img class="proof" data-src="'+encodeURI(o.proof_url)+'" alt="Comprobante de '+esc(o.code)+'" loading="lazy" decoding="async"></a>':'')+'</div><div>'+ (o.status==='pending'?'<button class="approve" onclick="act('+o.id+',\'approve\')">APROBAR PAGO</button> <button class="reject" onclick="act('+o.id+',\'reject\')">RECHAZAR</button>':o.status==='expired'?'<button class="approve" onclick="act('+o.id+',\'approve\')">VALIDAR PAGO VENCIDO</button>':'<span class="badge">'+esc(o.review_note||'Procesado')+'</span>')+'<button class="whatsapp" data-id="'+o.id+'" onclick="sendWhatsApp(this.dataset.id)">ENVIAR ESTADO POR WHATSAPP</button></div></div>').join('');
+  container.innerHTML=d.orders.map(o=>'<div class="card order"><div><h2><input class="order-select" type="checkbox" value="'+o.id+'" aria-label="Seleccionar '+esc(o.code)+'"> '+esc(o.code)+' <span class="badge">'+esc(statusLabels[o.status]||o.status.toUpperCase())+'</span></h2><p><b>'+esc(o.name)+'</b> · '+esc(o.phone)+' · '+o.quantity+' ticket(s) · S/'+o.total+'</p><p>Creado: '+esc(o.created_at)+' <span class="badge">HORA PERÚ</span></p><div class="tickets">'+o.tickets.map(t=>'<span class="ticket">#'+t+'</span>').join('')+'</div>'+(o.proof_url?'<a class="proof-wrap" href="'+encodeURI(o.proof_url)+'" target="_blank" title="Abrir comprobante completo"><img class="proof" data-src="'+encodeURI(o.proof_url)+'" alt="Comprobante de '+esc(o.code)+'" loading="lazy" decoding="async"></a>':'')+'</div><div>'+ (o.status==='pending'?'<button class="approve" onclick="act('+o.id+',\'approve\')">APROBAR PAGO</button> <button class="reject" onclick="act('+o.id+',\'reject\')">RECHAZAR</button>':o.status==='expired'?'<button class="approve" onclick="act('+o.id+',\'approve\')">VALIDAR PAGO VENCIDO</button>':'<span class="badge">'+esc(o.review_note||'Procesado')+'</span>')+'<button class="whatsapp" data-id="'+o.id+'" onclick="sendWhatsApp(this.dataset.id)">ENVIAR ESTADO POR WHATSAPP</button></div></div>').join('');
   if(!d.orders.length)container.innerHTML='<div class="loading">No hay solicitudes en esta categoría.</div>';
   activateProofs();
 }

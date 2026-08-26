@@ -620,6 +620,55 @@ def reject(oid):
     batch.commit()
     return jsonify(ok=True)
 
+@app.post("/api/admin/orders/delete-selected")
+@admin_required
+def delete_selected_orders():
+    data=request.json or {}
+    raw_ids=data.get("ids") or []
+    if not isinstance(raw_ids,list):
+        return jsonify(error="Selección inválida"),400
+    ids=list(dict.fromkeys(str(value).strip() for value in raw_ids))
+    if not ids or len(ids)>50 or any(not re.fullmatch(r"\d{10,24}",oid) for oid in ids):
+        return jsonify(error="Selecciona entre 1 y 50 compras válidas"),400
+    if data.get("confirmation")!="ELIMINAR":
+        return jsonify(error="Confirmación inválida"),400
+
+    db=firestore_db()
+    deleted=[]
+    not_found=[]
+    proof_warnings=[]
+    for oid in ids:
+        order_ref=db.collection("orders").document(oid)
+        snapshot=order_ref.get()
+        if not snapshot.exists:
+            not_found.append(oid)
+            continue
+        order=snapshot.to_dict() or {}
+
+        # Solo elimina tickets que todavía pertenecen a esta compra. Los
+        # números liberados que otra persona recibió nunca se tocan.
+        owned_tickets=list(
+            db.collection("tickets").where("order_id","==",oid).limit(100).stream()
+        )
+        batch=db.batch()
+        for ticket_snapshot in owned_tickets:
+            batch.delete(ticket_snapshot.reference)
+        batch.delete(order_ref)
+        batch.commit()
+        deleted.append(oid)
+
+        proof_path=order.get("proof_path")
+        if proof_path:
+            try:
+                storage_bucket().blob(proof_path).delete()
+            except Exception:
+                # La compra ya fue retirada del sistema. GCS tiene eliminación
+                # recuperable configurada y este aviso permite revisar el objeto.
+                proof_warnings.append(oid)
+
+    return jsonify(ok=True,deleted=deleted,not_found=not_found,
+                   proof_warnings=proof_warnings,count=len(deleted))
+
 @app.get("/api/admin/stats")
 @admin_required
 def stats():
