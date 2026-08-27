@@ -563,6 +563,7 @@ def export_admin_excel():
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.chart import BarChart, Reference
     from openpyxl.chart.label import DataLabelList
+    from openpyxl.chart.marker import DataPoint
     rows=[snapshot.to_dict() for snapshot in firestore_db().collection("orders").stream()]
     audit("export_excel",{"records":len(rows)})
     rows.sort(key=lambda row:int(row.get("created_at",0)), reverse=True)
@@ -764,16 +765,30 @@ def export_admin_excel():
     chart=BarChart()
     chart.type="col"
     chart.style=10
-    chart.title="Total aprobado y distribución por cuenta"
+    chart.title="Distribución de pagos aprobados"
     chart.y_axis.title="Monto (S/)"
-    chart.x_axis.title="Pagos"
+    chart.x_axis.title="Cuenta receptora"
+    chart.y_axis.numFmt='"S/" #,##0'
+    chart.y_axis.scaling.min=0
     chart.height=8
     chart.width=16
+    chart.gapWidth=70
     chart.add_data(Reference(payment_summary,min_col=2,min_row=5,max_row=7),titles_from_data=False)
     chart.set_categories(Reference(payment_summary,min_col=1,min_row=5,max_row=7))
     chart.legend=None
     chart.dataLabels=DataLabelList()
     chart.dataLabels.showVal=True
+    chart.dataLabels.numFmt='"S/" #,##0'
+    # Colores coherentes con las tarjetas: total amarillo, Omar verde y Franci azul.
+    chart.series[0].dPt=[DataPoint(idx=index) for index in range(3)]
+    chart_colors=[("FFD400","B38F00"),("16A66A","0B6B43"),("2563EB","1D4ED8")]
+    for point,(fill_color,line_color) in zip(chart.series[0].dPt,chart_colors):
+        point.graphicalProperties.solidFill=fill_color
+        point.graphicalProperties.line.solidFill=line_color
+    try:
+        chart.y_axis.majorGridlines.spPr.ln.solidFill="E5E7EB"
+    except Exception:
+        pass
     payment_summary.add_chart(chart,"D5")
     payment_summary.freeze_panes="A4"
 
