@@ -29,6 +29,12 @@ MAX_TICKETS = 999999
 PRICE = 10
 JSONPE_TOKEN = os.environ.get("JSONPE_TOKEN", "").strip()
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "").strip()
+PAYMENT_OMAR_NAMES = tuple(value.strip().upper() for value in
+    os.environ.get("PAYMENT_OMAR_NAMES","CARLOS OMAR MARIN").split(",") if value.strip())
+PAYMENT_FRANCI_NAMES = tuple(value.strip().upper() for value in
+    os.environ.get("PAYMENT_FRANCI_NAMES","ROCIO DEL PILAR,ROCIO ZAV,FRANCINE ZAVALA").split(",") if value.strip())
+PAYMENT_OMAR_LAST3 = os.environ.get("PAYMENT_OMAR_LAST3","598").strip()
+PAYMENT_FRANCI_LAST3 = os.environ.get("PAYMENT_FRANCI_LAST3","257").strip()
 DNI_CACHE = {}
 DNI_CACHE_SECONDS = 90*24*60*60
 _FIRESTORE_DB = None
@@ -102,6 +108,29 @@ def safe_filename_part(value):
     value=unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
     value=re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
     return value[:60] or "SIN_NOMBRE"
+
+def normalized_ocr_text(value):
+    value=unicodedata.normalize("NFKD",str(value or "")).encode("ascii","ignore").decode("ascii")
+    return re.sub(r"[ \t]+"," ",value).upper()
+
+def parse_yape_receipt(text):
+    """Extrae indicios visibles; no certifica que la imagen sea auténtica."""
+    clean=normalized_ocr_text(text)
+    compact=" ".join(clean.split())
+    amount_match=re.search(r"(?:S\s*/?\s*)(\d+(?:[.,]\d{1,2})?)",compact)
+    operation_match=re.search(r"(?:NRO\.?|NUMERO|NO\.?)?\s*DE\s*OPERACI[O0]N\s*[:#-]?\s*([0-9]{6,14})",compact)
+    security_match=re.search(r"C[O0]DIGO\s+DE\s+SEGURIDAD\s*[:#-]?\s*([0-9](?:\s*[0-9]){2})",compact)
+    destination_match=re.search(r"(?:NRO\.?\s*DE\s*CELULAR|CELULAR|DESTINO)\s*[:#-]?\s*(?:\*{2,}\s*){1,3}([0-9]{3})",compact)
+    amount=float(amount_match.group(1).replace(",",".")) if amount_match else None
+    security=re.sub(r"\D","",security_match.group(1)) if security_match else None
+    last3=destination_match.group(1) if destination_match else None
+    recipient=None
+    if last3 and hmac.compare_digest(last3,PAYMENT_OMAR_LAST3): recipient="omar"
+    elif last3 and hmac.compare_digest(last3,PAYMENT_FRANCI_LAST3): recipient="franci"
+    elif any(name in compact for name in PAYMENT_OMAR_NAMES): recipient="omar"
+    elif any(name in compact for name in PAYMENT_FRANCI_NAMES): recipient="franci"
+    return {"amount":amount,"operation_number":operation_match.group(1) if operation_match else None,
+            "security_code":security,"destination_last3":last3,"recipient":recipient}
 
 def lima_datetime_text(timestamp):
     """Convierte un timestamp UTC a la fecha y hora administrativa de Perú."""
@@ -819,6 +848,59 @@ def proof(filename):
     except Exception:
         return "No se pudo cargar el comprobante",404
 
+@app.post("/api/admin/orders/<oid>/analyze-proofs")
+@admin_required
+@roles_allowed("owner","validator")
+@limiter.limit("20 per hour")
+def analyze_proofs(oid):
+    ref=firestore_db().collection("orders").document(oid)
+    snapshot=ref.get()
+    if not snapshot.exists: return jsonify(error="No encontrado"),404
+    order=snapshot.to_dict() or {}
+    paths=order.get("proof_paths") or ([order.get("proof_path")] if order.get("proof_path") else [])
+    paths=[path for path in paths if path]
+    if not paths: return jsonify(error="La solicitud no tiene comprobantes"),400
+    try:
+        from google.cloud import vision
+        client=vision.ImageAnnotatorClient()
+        receipts=[]
+        for path in paths:
+            raw=storage_bucket().blob(path).download_as_bytes()
+            response=client.text_detection(image=vision.Image(content=raw))
+            if response.error.message: raise RuntimeError(response.error.message)
+            text=response.full_text_annotation.text or (response.text_annotations[0].description if response.text_annotations else "")
+            receipts.append(parse_yape_receipt(text))
+    except Exception:
+        app.logger.exception("No se pudo analizar el comprobante de %s",oid)
+        return jsonify(error=("No se pudo leer el comprobante. Verifica que Cloud Vision API esté habilitada "
+                              "y revisa el pago manualmente.")),503
+
+    flags=[]; duplicate_operations=[]
+    operations=[item["operation_number"] for item in receipts if item.get("operation_number")]
+    if len(operations)!=len(set(operations)):
+        flags.append("OPERACIÓN REPETIDA ENTRE LAS CAPTURAS")
+    for operation in set(operations):
+        matches=firestore_db().collection("orders").where(
+            "payment_operation_numbers","array_contains",operation).limit(3).stream()
+        if any(match.id!=oid for match in matches): duplicate_operations.append(operation)
+    if duplicate_operations: flags.append("OPERACIÓN YA UTILIZADA EN OTRA COMPRA")
+    readable_amounts=[item["amount"] for item in receipts if item.get("amount") is not None]
+    if len(readable_amounts)!=len(receipts): flags.append("MONTO ILEGIBLE O AUSENTE")
+    detected_total=round(sum(readable_amounts),2)
+    if readable_amounts and detected_total!=float(order.get("total",0)):
+        flags.append("MONTO TOTAL DIFERENTE A LA COMPRA")
+    if any(not item.get("recipient") for item in receipts): flags.append("DESTINATARIO NO RECONOCIDO")
+    if any(not item.get("security_code") for item in receipts): flags.append("CÓDIGO DE SEGURIDAD ILEGIBLE O AUSENTE")
+    if any(not item.get("operation_number") for item in receipts): flags.append("NÚMERO DE OPERACIÓN ILEGIBLE O AUSENTE")
+    status="REQUIERE REVISIÓN" if flags else "DATOS COINCIDENTES"
+    analysis={"status":status,"flags":flags,"receipts":receipts,"detected_total":detected_total,
+              "duplicate_operations":duplicate_operations,"analyzed_at":int(time.time()),
+              "analyzed_by":getattr(g,"admin_user",ADMIN_USER)}
+    ref.update({"payment_analysis":analysis,"payment_operation_numbers":list(dict.fromkeys(operations))})
+    audit("payment_proofs_analyzed",{"order_id":oid,"order_code":order.get("code"),
+                                      "result":status,"flags":flags})
+    return jsonify(ok=True,analysis=analysis)
+
 @app.post("/api/admin/orders/<oid>/approve")
 @admin_required
 @roles_allowed("owner","validator")
@@ -829,10 +911,14 @@ def approve(oid):
     order=snapshot.to_dict()
     if order["status"] not in {"pending","expired"}:
         return jsonify(error="La solicitud ya fue procesada"),400
+    data=request.json or {}
+    if not order.get("payment_analysis"):
+        return jsonify(error="Analiza primero los comprobantes antes de aprobar el pago"),400
+    if data.get("manual_verified") is not True:
+        return jsonify(error="Confirma primero que el dinero aparece en el Yape receptor"),400
     now=int(time.time())
     reviewed_at_text=time.strftime("%Y-%m-%d %H:%M:%S",time.gmtime(now))
     requested_note=(request.json or {}).get("note") or "Pago validado"
-    data=request.json or {}
     try:
         amount_omar=int(data.get("amount_omar",0)); amount_franci=int(data.get("amount_franci",0))
     except (TypeError,ValueError):
