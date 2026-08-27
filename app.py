@@ -561,6 +561,8 @@ def export_admin_excel():
     # no durante el arranque normal de la web ni del panel.
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.chart.label import DataLabelList
     rows=[snapshot.to_dict() for snapshot in firestore_db().collection("orders").stream()]
     audit("export_excel",{"records":len(rows)})
     rows.sort(key=lambda row:int(row.get("created_at",0)), reverse=True)
@@ -579,6 +581,7 @@ def export_admin_excel():
     summary=workbook.active
     summary.title="Resumen"
     detail=workbook.create_sheet("Participantes y pagos")
+    payment_summary=workbook.create_sheet("Resumen de pagos",1)
     yellow="FFD400"; dark="111117"; white="FFFFFF"; light="F2F2F2"
     thin=Side(style="thin",color="D9D9D9")
     summary.sheet_view.showGridLines=False
@@ -706,6 +709,77 @@ def export_admin_excel():
         detail.column_dimensions[chr(64+index)].width=width
     detail.freeze_panes="A2"
     detail.auto_filter.ref=f"A1:P{max(detail.max_row,1)}"
+
+    # Resumen financiero separado, calculado desde la hoja de detalle.
+    payment_summary.sheet_view.showGridLines=False
+    payment_summary.merge_cells("A1:H2")
+    payment_summary["A1"]="CHAPA TU SUERTE — RESUMEN DE PAGOS"
+    payment_summary["A1"].font=Font(name="Calibri",bold=True,size=20,color=white)
+    payment_summary["A1"].fill=PatternFill("solid",fgColor=dark)
+    payment_summary["A1"].alignment=Alignment(horizontal="center",vertical="center")
+    payment_summary.merge_cells("A3:H3")
+    payment_summary["A3"]="Distribución de pagos aprobados · Hora de Perú"
+    payment_summary["A3"].font=Font(italic=True,color="D1D5DB")
+    payment_summary["A3"].fill=PatternFill("solid",fgColor="24242D")
+    payment_summary["A3"].alignment=Alignment(horizontal="center")
+
+    last_detail_row=max(detail.max_row,2)
+    payment_summary["A5"]="TOTAL PAGOS APROBADOS"
+    payment_summary["A6"]="RECIBIDO POR OMAR"
+    payment_summary["A7"]="RECIBIDO POR FRANCI"
+    payment_summary["A8"]="PENDIENTE DE CLASIFICAR"
+    payment_summary["B5"]=(f'=SUMIFS(\'Participantes y pagos\'!$G$2:$G${last_detail_row},'
+                              f'\'Participantes y pagos\'!$J$2:$J${last_detail_row},"Aprobada")')
+    payment_summary["B6"]=f"=SUM('Participantes y pagos'!$H$2:$H${last_detail_row})"
+    payment_summary["B7"]=f"=SUM('Participantes y pagos'!$I$2:$I${last_detail_row})"
+    payment_summary["B8"]="=MAX(B5-B6-B7,0)"
+
+    label_fills=["24242D","166534","1D4ED8","92400E"]
+    value_fills=["FFF7CC","DCFCE7","DBEAFE","FEF3C7"]
+    value_fonts=[dark,"166534","1E40AF","92400E"]
+    for offset,row_number in enumerate(range(5,9)):
+        label=payment_summary.cell(row_number,1)
+        value=payment_summary.cell(row_number,2)
+        label.font=Font(bold=True,color=white)
+        label.fill=PatternFill("solid",fgColor=label_fills[offset])
+        label.alignment=Alignment(vertical="center")
+        value.font=Font(bold=True,size=18,color=value_fonts[offset])
+        value.fill=PatternFill("solid",fgColor=value_fills[offset])
+        value.alignment=Alignment(horizontal="right",vertical="center")
+        value.number_format='"S/" #,##0'
+        label.border=value.border=Border(bottom=thin)
+        payment_summary.row_dimensions[row_number].height=34
+    payment_summary.column_dimensions["A"].width=29
+    payment_summary.column_dimensions["B"].width=18
+    for column in "CDEFGHIJK": payment_summary.column_dimensions[column].width=12
+
+    payment_summary.merge_cells("A10:B12")
+    payment_summary["A10"]=("Si ‘Pendiente de clasificar’ es mayor que S/0, revisa las compras aprobadas "
+                              "y confirma la distribución entre Omar y Franci en el panel.")
+    payment_summary["A10"].fill=PatternFill("solid",fgColor="FFF7CC")
+    payment_summary["A10"].font=Font(italic=True,color="594A00")
+    payment_summary["A10"].alignment=Alignment(wrap_text=True,vertical="center")
+    for row_number in range(10,13): payment_summary.row_dimensions[row_number].height=25
+
+    chart=BarChart()
+    chart.type="col"
+    chart.style=10
+    chart.title="Total aprobado y distribución por cuenta"
+    chart.y_axis.title="Monto (S/)"
+    chart.x_axis.title="Pagos"
+    chart.height=8
+    chart.width=16
+    chart.add_data(Reference(payment_summary,min_col=2,min_row=5,max_row=7),titles_from_data=False)
+    chart.set_categories(Reference(payment_summary,min_col=1,min_row=5,max_row=7))
+    chart.legend=None
+    chart.dataLabels=DataLabelList()
+    chart.dataLabels.showVal=True
+    payment_summary.add_chart(chart,"D5")
+    payment_summary.freeze_panes="A4"
+
+    workbook.calculation.fullCalcOnLoad=True
+    workbook.calculation.forceFullCalc=True
+    workbook.calculation.calcMode="auto"
 
     output=BytesIO()
     workbook.save(output)
