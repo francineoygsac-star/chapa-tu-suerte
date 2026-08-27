@@ -555,7 +555,7 @@ def admin_orders():
 
 @app.get("/api/admin/export.xlsx")
 @admin_required
-@roles_allowed("owner")
+@roles_allowed("owner","validator")
 def export_admin_excel():
     # Estas librerías son pesadas; se cargan solo cuando se descarga el Excel,
     # no durante el arranque normal de la web ni del panel.

@@ -22,7 +22,7 @@ async function login(){let r=await fetch('/admin/login',{method:'POST',headers:{
 async function logout(){await fetch('/admin/logout',{method:'POST',headers:adminHeaders()});csrfToken='';location.reload()}
 async function revokeAllSessions(){if(!confirm('Se cerrará el panel en todos los dispositivos. ¿Deseas continuar?'))return;const r=await fetch('/api/admin/sessions/revoke-all',{method:'POST',headers:adminHeaders()});const d=await r.json();if(!r.ok){alert(d.error||'No se pudieron cerrar las sesiones.');return}csrfToken='';alert('Todas las sesiones fueron cerradas.');location.reload()}
 function downloadExcel(){window.location.href='/api/admin/export.xlsx'}
-function configureRole(){const labels={owner:'ADMINISTRADOR PRINCIPAL',validator:'VALIDADOR DE PAGOS',viewer:'SOLO CONSULTA'};currentIdentity.textContent=currentUser+' · '+(labels[currentRole]||currentRole);const owner=currentRole==='owner';revokeBtn.style.display=owner?'inline-block':'none';exportBtn.style.display=owner?'inline-block':'none';deleteBtn.style.display=owner?'inline-block':'none';usersBtn.style.display=owner?'inline-block':'none'}
+function configureRole(){const labels={owner:'ADMINISTRADOR PRINCIPAL',validator:'VALIDADOR DE PAGOS',viewer:'SOLO CONSULTA'};currentIdentity.textContent=currentUser+' · '+(labels[currentRole]||currentRole);const owner=currentRole==='owner';const canExport=owner||currentRole==='validator';revokeBtn.style.display=owner?'inline-block':'none';exportBtn.style.display=canExport?'inline-block':'none';deleteBtn.style.display=owner?'inline-block':'none';usersBtn.style.display=owner?'inline-block':'none'}
 function toggleUsers(){usersPanel.style.display=usersPanel.style.display==='none'?'block':'none';if(usersPanel.style.display==='block')loadUsers()}
 async function stats(){let r=await fetch('/api/admin/stats');if(!r.ok)return;let d=await r.json();document.getElementById('stats').innerHTML=[['Pendientes',d.pending],['Aprobadas',d.approved],['Rechazadas',d.rejected],['Tickets confirmados',d.confirmed_tickets],['Ventas aprobadas','S/'+d.sales_approved]].map(x=>'<div class="stat">'+x[0]+'<b>'+x[1]+'</b></div>').join('')}
 let proofObserver;
@@ -83,6 +83,10 @@ function activateProofs(){
   }),{rootMargin:'300px 0px'});
   document.querySelectorAll('img[data-src]').forEach(img=>proofObserver.observe(img));
 }
+function allocationFieldsHtml(id,total,omar,franci){return '<div style="margin-bottom:9px"><label style="display:block;margin:6px 0">Monto recibido por Omar (S/)</label><input id="amount-omar-'+id+'" type="number" min="0" step="1" value="'+omar+'" style="width:100%;padding:9px;box-sizing:border-box;border-radius:7px"><label style="display:block;margin:6px 0">Monto recibido por Franci (S/)</label><input id="amount-franci-'+id+'" type="number" min="0" step="1" value="'+franci+'" style="width:100%;padding:9px;box-sizing:border-box;border-radius:7px"><small>La suma debe ser S/'+total+'</small></div>'}
+function whatsappButtonHtml(id){return '<button class="whatsapp" data-id="'+id+'" onclick="sendWhatsApp(this.dataset.id)">ENVIAR ESTADO POR WHATSAPP</button>'}
+function confirmedAllocationHtml(id,total,omar,franci){return '<div style="background:#071b12;border:1px solid #15915c;border-radius:10px;padding:13px;margin-bottom:9px"><b style="color:#79e5ae">✓ DISTRIBUCIÓN CONFIRMADA</b><p style="margin:9px 0 4px">Omar: <b>S/'+omar+'</b></p><p style="margin:4px 0">Franci: <b>S/'+franci+'</b></p><p style="margin:4px 0">Total: <b>S/'+total+'</b></p></div><button onclick="editAllocation('+id+','+total+','+omar+','+franci+')">MODIFICAR DISTRIBUCIÓN</button>'}
+function editAllocation(id,total,omar,franci){if(!confirm('La distribución ya fue confirmada. ¿Deseas habilitarla para corregir los montos?'))return;const box=document.getElementById('actions-'+id);box.innerHTML=allocationFieldsHtml(id,total,omar,franci)+'<button onclick="saveAllocation('+id+','+total+')" style="background:#ffd400">GUARDAR CAMBIOS</button>'+whatsappButtonHtml(id)}
 async function load(status){
   currentStatus=status;
   const container=document.getElementById('orders');
@@ -97,14 +101,16 @@ async function load(status){
     let actions='<span class="badge">'+esc(o.review_note||'Procesado')+'</span>';
     const oldOmar=o.payment_recipient==='omar'?o.total:0,oldFranci=o.payment_recipient==='franci'?o.total:0;
     const amountOmar=o.payment_amount_omar??oldOmar,amountFranci=o.payment_amount_franci??oldFranci;
-    const allocation='<div style="margin-bottom:9px"><label style="display:block;margin:6px 0">Monto recibido por Omar (S/)</label><input id="amount-omar-'+o.id+'" type="number" min="0" step="1" value="'+amountOmar+'" style="width:100%;padding:9px;box-sizing:border-box;border-radius:7px"><label style="display:block;margin:6px 0">Monto recibido por Franci (S/)</label><input id="amount-franci-'+o.id+'" type="number" min="0" step="1" value="'+amountFranci+'" style="width:100%;padding:9px;box-sizing:border-box;border-radius:7px"><small>La suma debe ser S/'+o.total+'</small></div>';
+    const allocation=allocationFieldsHtml(o.id,o.total,amountOmar,amountFranci);
+    const allocationConfirmed=o.payment_amount_omar!==null&&o.payment_amount_omar!==undefined&&o.payment_amount_franci!==null&&o.payment_amount_franci!==undefined;
     if(canValidate&&o.status==='pending')actions=allocation+'<button class="approve" onclick="act('+o.id+',\'approve\')">APROBAR PAGO</button> <button class="reject" onclick="act('+o.id+',\'reject\')">RECHAZAR</button>';
     else if(canValidate&&o.status==='expired')actions=allocation+'<button class="approve" onclick="act('+o.id+',\'approve\')">VALIDAR PAGO VENCIDO</button>';
+    else if(canValidate&&o.status==='approved'&&allocationConfirmed)actions=confirmedAllocationHtml(o.id,o.total,amountOmar,amountFranci);
     else if(canValidate&&o.status==='approved')actions=allocation+'<button onclick="saveAllocation('+o.id+','+o.total+')" style="background:#ffd400">GUARDAR DISTRIBUCIÓN DEL PAGO</button>';
-    if(canValidate)actions+='<button class="whatsapp" data-id="'+o.id+'" onclick="sendWhatsApp(this.dataset.id)">ENVIAR ESTADO POR WHATSAPP</button>';
+    if(canValidate)actions+=whatsappButtonHtml(o.id);
     const proofUrls=(o.proof_urls&&o.proof_urls.length?o.proof_urls:(o.proof_url?[o.proof_url]:[]));
     const proofs=proofUrls.map((url,index)=>'<a class="proof-wrap" href="'+encodeURI(url)+'" target="_blank" title="Abrir comprobante '+(index+1)+'"><img class="proof" data-src="'+encodeURI(url)+'" alt="Comprobante '+(index+1)+' de '+esc(o.code)+'" loading="lazy" decoding="async"></a>').join(' ');
-    return '<div class="card order"><div><h2>'+selector+esc(o.code)+' <span class="badge">'+esc(statusLabels[o.status]||o.status.toUpperCase())+'</span></h2><p><b>'+esc(o.name)+'</b> · '+esc(o.phone)+' · '+o.quantity+' ticket(s) · S/'+o.total+'</p><p>Creado: '+esc(o.created_at)+' <span class="badge">HORA PERÚ</span></p><div class="tickets">'+o.tickets.map(t=>'<span class="ticket">#'+t+'</span>').join('')+'</div>'+(proofs?'<p><b>Comprobantes: '+proofUrls.length+'</b></p>'+proofs:'')+'</div><div>'+actions+'</div></div>';
+    return '<div class="card order"><div><h2>'+selector+esc(o.code)+' <span class="badge">'+esc(statusLabels[o.status]||o.status.toUpperCase())+'</span></h2><p><b>'+esc(o.name)+'</b> · '+esc(o.phone)+' · '+o.quantity+' ticket(s) · S/'+o.total+'</p><p>Creado: '+esc(o.created_at)+' <span class="badge">HORA PERÚ</span></p><div class="tickets">'+o.tickets.map(t=>'<span class="ticket">#'+t+'</span>').join('')+'</div>'+(proofs?'<p><b>Comprobantes: '+proofUrls.length+'</b></p>'+proofs:'')+'</div><div id="actions-'+o.id+'">'+actions+'</div></div>';
   }).join('');
   if(!d.orders.length)container.innerHTML='<div class="loading">No hay solicitudes en esta categoría.</div>';
   activateProofs();
